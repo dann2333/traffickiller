@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"os"
 	"sort"
@@ -23,8 +22,8 @@ import (
 // 资源列表来自 https://hoyo-files.amarea.cn/ ，实际文件都在米哈游官方 CDN 上。
 const apiBase = "https://autopatch.amarea.cn/pkg_version"
 
-// 每个游戏最多保留的分块数（随机抽样），约 20GB 不重复数据，够用且省内存。
-const maxChunks = 20000
+// 同时下载解析的清单数上限，避免多个 zstd 解码器同时占用大量内存。
+var manifestSem = make(chan struct{}, 2)
 
 var gameIDs = []string{"hk4e", "hkrpg", "nap", "bh3"}
 
@@ -83,7 +82,7 @@ func loadGames(ctx context.Context, c *http.Client, games []string, all bool) []
 	wg.Wait()
 	var out []*group
 	for _, g := range res {
-		if g != nil && len(g.items) > 0 {
+		if g != nil && g.count > 0 {
 			out = append(out, g)
 		}
 	}
@@ -102,12 +101,12 @@ func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group,
 	sort.Slice(keys, func(i, j int) bool { return verLess(keys[j], keys[i]) }) // 新版本在前
 
 	g := &group{name: gameNames[id]}
-	direct := &urlParts{}
+	b := newSourceBuilder("", "", 0)
 	seen := map[string]bool{}
 	add := func(u string, size int64) {
 		if !seen[u] {
 			seen[u] = true
-			g.items = append(g.items, item{parts: direct, name: u, size: size})
+			b.add([]byte(u), size)
 		}
 	}
 
@@ -115,15 +114,17 @@ func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group,
 		for _, k := range keys {
 			collectURLs(vers[k], add)
 		}
-		g.desc = fmt.Sprintf("全部版本 %d 个整包", len(g.items))
+		g.add(b.build())
+		g.desc = fmt.Sprintf("全部版本 整包 %d 个", g.count)
 		return g, nil
 	}
 
 	// 最新版本：优先整包，没有整包则用 Sophon 分块（当前正式版 main 分支）。
 	for _, k := range keys {
 		collectURLs(vers[k], add)
-		if len(g.items) > 0 {
-			g.desc = fmt.Sprintf("%s 整包 %d 个", k, len(g.items))
+		if len(seen) > 0 {
+			g.add(b.build())
+			g.desc = fmt.Sprintf("%s 整包 %d 个", k, g.count)
 			return g, nil
 		}
 		if e, _ := vers[k].(map[string]any); e != nil {
@@ -179,43 +180,81 @@ type sophonDL struct {
 	URLSuffix   string `json:"url_suffix"`
 }
 
+type sophonManifest struct {
+	Field    string `json:"matching_field"`
+	Manifest struct {
+		ID string `json:"id"`
+	} `json:"manifest"`
+	ChunkDL    sophonDL `json:"chunk_download"`
+	ManifestDL sophonDL `json:"manifest_download"`
+	Stats      struct {
+		ChunkCount string `json:"chunk_count"`
+	} `json:"stats"`
+}
+
 type sophonBuild struct {
 	Data struct {
-		Manifests []struct {
-			Field    string `json:"matching_field"`
-			Manifest struct {
-				ID string `json:"id"`
-			} `json:"manifest"`
-			ChunkDL    sophonDL `json:"chunk_download"`
-			ManifestDL sophonDL `json:"manifest_download"`
-			Stats      struct {
-				Size string `json:"compressed_size"`
-			} `json:"stats"`
-		} `json:"manifests"`
+		Manifests []sophonManifest `json:"manifests"`
 	} `json:"data"`
 }
 
-// loadSophon 读取该版本最大的 Sophon 清单，随机抽取最多 maxChunks 个分块。
+// loadSophon 读取该版本全部 Sophon 清单（游戏本体 + 各语音包），保留所有分块。
 func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) error {
 	var b sophonBuild
 	if err := getJSON(ctx, c, fmt.Sprintf("%s/chunk/%s_%s.json", apiBase, id, tag), &b); err != nil {
 		return err
 	}
-	best, bestSize := -1, int64(-1)
-	for i, m := range b.Data.Manifests {
-		s, _ := strconv.ParseInt(m.Stats.Size, 10, 64)
-		if m.ManifestDL.Encryption == 0 && s > bestSize {
-			best, bestSize = i, s
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+		seen     = map[string]bool{}
+	)
+	for _, m := range b.Data.Manifests {
+		if m.ManifestDL.Encryption != 0 || seen[m.Manifest.ID] {
+			continue
 		}
+		seen[m.Manifest.ID] = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			src, err := loadManifest(ctx, c, m)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("清单 %s: %w", m.Field, err)
+				}
+				return
+			}
+			g.add(src)
+		}()
 	}
-	if best < 0 {
-		return errors.New("没有可用的分块清单")
+	wg.Wait()
+	if g.count == 0 {
+		if firstErr == nil {
+			firstErr = errors.New("没有可用的分块清单")
+		}
+		return firstErr
 	}
-	m := b.Data.Manifests[best]
-	parts := &urlParts{prefix: m.ChunkDL.URLPrefix + "/", suffix: m.ChunkDL.URLSuffix}
-	murl := m.ManifestDL.URLPrefix + "/" + m.Manifest.ID + m.ManifestDL.URLSuffix
+	if firstErr != nil && ctx.Err() == nil {
+		con.logf("%s: 部分清单读取失败，已跳过: %v", g.name, firstErr)
+	}
+	g.desc = fmt.Sprintf("%s 分块 %d 个 (%d 个清单)", tag, g.count, len(g.sources))
+	return nil
+}
 
-	var total int
+func loadManifest(ctx context.Context, c *http.Client, m sophonManifest) (*source, error) {
+	select {
+	case manifestSem <- struct{}{}:
+		defer func() { <-manifestSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	hint, _ := strconv.Atoi(m.Stats.ChunkCount)
+	hint = min(max(hint, 0), 1<<20) // 仅用于预分配，防止异常数据
+	murl := m.ManifestDL.URLPrefix + "/" + m.Manifest.ID + m.ManifestDL.URLSuffix
+	var src *source
 	err := retry(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancel()
@@ -233,24 +272,14 @@ func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) e
 			defer zr.Close()
 			r = zr
 		}
-		g.items, total = g.items[:0], 0
-		return parseManifest(r, func(name []byte, size int64) {
-			total++
-			it := item{parts: parts, size: size}
-			if len(g.items) < maxChunks {
-				it.name = string(name)
-				g.items = append(g.items, it)
-			} else if j := rand.IntN(total); j < maxChunks {
-				it.name = string(name)
-				g.items[j] = it
-			}
-		})
+		b := newSourceBuilder(m.ChunkDL.URLPrefix+"/", m.ChunkDL.URLSuffix, hint)
+		if err := parseManifest(r, b.add); err != nil {
+			return err
+		}
+		src = b.build()
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("读取分块清单失败: %w", err)
-	}
-	g.desc = fmt.Sprintf("%s 分块 %d/%d 个 (%s)", tag, len(g.items), total, m.Field)
-	return nil
+	return src, err
 }
 
 var errBadManifest = errors.New("清单格式错误")

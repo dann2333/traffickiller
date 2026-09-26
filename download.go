@@ -8,34 +8,71 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type urlParts struct{ prefix, suffix string }
+// span 指向 source.names 里的一段，即一个文件名（或完整 URL）。
+type span struct{ off, n uint32 }
 
-// item 是一个可下载的文件；URL = prefix + name + suffix（分块共用前缀以节省内存）。
-type item struct {
-	parts *urlParts
-	name  string
-	size  int64
+// source 是一批共享 URL 前后缀的文件。几十万个文件名紧凑地存放在一个字符串里，
+// 每个文件只额外占 8 字节，保留全部分块也只需十几 MB 内存。
+type source struct {
+	prefix, suffix string
+	names          string
+	items          []span
+	bytes          int64
 }
 
-func (it item) url() string { return it.parts.prefix + it.name + it.parts.suffix }
+func (s *source) url(sp span) string {
+	return s.prefix + s.names[sp.off:sp.off+sp.n] + s.suffix
+}
 
-// group 是一组资源（通常是一个游戏）。
+// sourceBuilder 逐个追加文件来构建 source。
+type sourceBuilder struct {
+	src   source
+	names strings.Builder
+}
+
+func newSourceBuilder(prefix, suffix string, sizeHint int) *sourceBuilder {
+	b := &sourceBuilder{src: source{prefix: prefix, suffix: suffix, items: make([]span, 0, sizeHint)}}
+	b.names.Grow(sizeHint * 50)
+	return b
+}
+
+func (b *sourceBuilder) add(name []byte, size int64) {
+	b.src.items = append(b.src.items, span{uint32(b.names.Len()), uint32(len(name))})
+	b.names.Write(name)
+	b.src.bytes += size
+}
+
+func (b *sourceBuilder) build() *source {
+	b.src.names = b.names.String()
+	return &b.src
+}
+
+// group 是一个游戏（或自定义 URL 列表）的全部资源。
 type group struct {
-	name  string
-	desc  string
-	items []item
-	fails int // 连续失效 (403/404/410) 次数
+	name    string
+	desc    string
+	sources []*source
+	count   int // 文件总数
+	fails   int // 连续失效 (403/404/410) 次数
+}
+
+func (g *group) add(s *source) {
+	if len(s.items) > 0 {
+		g.sources = append(g.sources, s)
+		g.count += len(s.items)
+	}
 }
 
 func (g *group) bytes() (n int64) {
-	for _, it := range g.items {
-		n += it.size
+	for _, s := range g.sources {
+		n += s.bytes
 	}
 	return n
 }
@@ -46,18 +83,25 @@ type pool struct {
 	groups []*group
 }
 
-func (p *pool) pick() (*group, item, bool) {
+func (p *pool) pick() (*group, *source, span, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.groups) == 0 {
-		return nil, item{}, false
+		return nil, nil, span{}, false
 	}
 	g := p.groups[rand.IntN(len(p.groups))]
-	return g, g.items[rand.IntN(len(g.items))], true
+	i := rand.IntN(g.count)
+	for _, s := range g.sources {
+		if i < len(s.items) {
+			return g, s, s.items[i], true
+		}
+		i -= len(s.items)
+	}
+	panic("pool: count out of sync")
 }
 
 // report 记录下载结果；gone 表示该文件已失效。返回整个来源是否被停用。
-func (p *pool) report(g *group, it item, gone bool) bool {
+func (p *pool) report(g *group, s *source, sp span, gone bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !gone {
@@ -65,22 +109,20 @@ func (p *pool) report(g *group, it item, gone bool) bool {
 		return false
 	}
 	g.fails++
-	for i := range g.items {
-		if g.items[i] == it {
-			last := len(g.items) - 1
-			g.items[i] = g.items[last]
-			g.items = g.items[:last]
-			break
+	if i := slices.Index(s.items, sp); i >= 0 {
+		s.items[i] = s.items[len(s.items)-1]
+		s.items = s.items[:len(s.items)-1]
+		g.count--
+		if len(s.items) == 0 {
+			g.sources = slices.DeleteFunc(g.sources, func(x *source) bool { return x == s })
 		}
 	}
-	if len(g.items) > 0 && g.fails < 10 {
+	if g.count > 0 && g.fails < 10 {
 		return false
 	}
-	for i := range p.groups {
-		if p.groups[i] == g {
-			p.groups = append(p.groups[:i], p.groups[i+1:]...)
-			return true
-		}
+	if i := slices.Index(p.groups, g); i >= 0 {
+		p.groups = slices.Delete(p.groups, i, i+1)
+		return true
 	}
 	return false
 }
@@ -165,12 +207,12 @@ func (d *downloader) worker(ctx context.Context, c *http.Client) {
 	buf := make([]byte, 64<<10)
 	backoff := time.Second
 	for ctx.Err() == nil {
-		g, it, ok := d.pool.pick()
+		g, s, sp, ok := d.pool.pick()
 		if !ok {
 			d.stop(errNoSource)
 			return
 		}
-		u := it.url()
+		u := s.url(sp)
 		if d.plainHTTP && strings.HasPrefix(u, "https://") {
 			u = "http://" + u[len("https://"):]
 		}
@@ -180,7 +222,7 @@ func (d *downloader) worker(ctx context.Context, c *http.Client) {
 		}
 		var se statusError
 		gone := errors.As(err, &se) && (se == 403 || se == 404 || se == 410)
-		if d.pool.report(g, it, gone) {
+		if d.pool.report(g, s, sp, gone) {
 			con.logf("%s: 资源连续失效 (%v)，已停用该来源", g.name, err)
 		}
 		if err == nil || gone {

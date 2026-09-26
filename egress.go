@@ -113,7 +113,6 @@ func (e egress) client(conc int) *http.Client {
 		MaxIdleConnsPerHost:   conc,
 		DisableCompression:    true,
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
-		ReadBufferSize:        64 << 10,
 	}
 	return &http.Client{Transport: tr}
 }

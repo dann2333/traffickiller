@@ -103,27 +103,73 @@ func TestParseManifest(t *testing.T) {
 	}
 }
 
+func TestSourceBuilder(t *testing.T) {
+	b := newSourceBuilder("https://cdn/x/", "?s", 2)
+	b.add([]byte("aa"), 10)
+	b.add([]byte("bbb"), 20)
+	src := b.build()
+	if got := src.url(src.items[1]); got != "https://cdn/x/bbb?s" {
+		t.Fatalf("url = %q", got)
+	}
+	if src.bytes != 30 || len(src.items) != 2 {
+		t.Fatalf("bytes = %d, items = %d", src.bytes, len(src.items))
+	}
+}
+
 func TestPoolDropsDeadSource(t *testing.T) {
-	parts := &urlParts{}
 	g := &group{name: "x"}
-	for i := range 20 {
-		g.items = append(g.items, item{parts: parts, name: string(rune('a' + i))})
+	for range 2 {
+		b := newSourceBuilder("", "", 0)
+		for i := range 10 {
+			b.add([]byte{byte('a' + i)}, 1)
+		}
+		g.add(b.build())
 	}
 	p := &pool{groups: []*group{g}}
 	for i := range 9 {
-		_, it, _ := p.pick()
-		if p.report(g, it, true) {
+		_, s, sp, _ := p.pick()
+		if p.report(g, s, sp, true) {
 			t.Fatalf("group dropped too early at %d", i)
 		}
 	}
-	if len(g.items) != 11 {
-		t.Fatalf("items = %d, want 11", len(g.items))
+	if g.count != 11 {
+		t.Fatalf("count = %d, want 11", g.count)
 	}
-	_, it, _ := p.pick()
-	if !p.report(g, it, true) {
+	_, s, sp, _ := p.pick()
+	p.report(g, s, sp, false) // 成功一次会清零连续失败计数
+	for range 9 {
+		_, s, sp, _ := p.pick()
+		if p.report(g, s, sp, true) {
+			t.Fatal("group dropped although failures were not consecutive")
+		}
+	}
+	_, s, sp, _ = p.pick()
+	if !p.report(g, s, sp, true) {
 		t.Fatal("group should be dropped after 10 consecutive failures")
 	}
-	if _, _, ok := p.pick(); ok {
+	if _, _, _, ok := p.pick(); ok {
 		t.Fatal("pool should be empty")
+	}
+}
+
+func TestPoolEmptiesSource(t *testing.T) {
+	g := &group{name: "x"}
+	for _, n := range []int{1, 3} {
+		b := newSourceBuilder("", "", 0)
+		for i := range n {
+			b.add([]byte{byte('a' + i)}, 1)
+		}
+		g.add(b.build())
+	}
+	p := &pool{groups: []*group{g}}
+	small := g.sources[0]
+	p.report(g, small, small.items[0], true)
+	if len(g.sources) != 1 || g.count != 3 {
+		t.Fatalf("sources = %d, count = %d", len(g.sources), g.count)
+	}
+	for range 100 {
+		if _, s, _, _ := p.pick(); s == small {
+			t.Fatal("picked from emptied source")
+		}
 	}
 }

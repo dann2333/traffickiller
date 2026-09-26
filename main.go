@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -17,6 +18,9 @@ import (
 )
 
 var version = "dev"
+
+// 默认 UA 与米哈游启动器 (HoYoPlay) 下载资源时一致。
+const defaultUA = "HYPContainer/1.10.1.283 (windows 10)"
 
 var userAgent string
 
@@ -35,7 +39,7 @@ const usage = `traffickiller %s - 流量消耗器
 选项:
   -i, -iface <网卡>    出口网卡名或本机 IP，多个用逗号分隔 (如 eth0 / pppoe-wan,pppoe-wan2)
                        默认走系统路由；多网卡时并发连接轮流分配到各网卡
-  -c, -conc <数量>     并发连接数 (默认 8)
+  -c, -conc <数量>     并发连接数 (默认 32；跑 5Gbps 以上建议 64 或更高)
   -l, -limit <带宽>    总带宽上限，默认不限。100M / 100Mbps = 100 兆比特每秒 (宽带口径)，
                        12MB / 12MB/s = 12 兆字节每秒
   -t, -total <流量>    累计下载达到该流量后退出，如 500G、1.5T、800MB (1024 进制)
@@ -47,11 +51,12 @@ const usage = `traffickiller %s - 流量消耗器
   -6                   绑定网卡时优先使用 IPv6 地址
   -http                CDN 下载改用 HTTP 而非 HTTPS，省去 TLS 解密开销 (适合路由器等弱 CPU 设备)
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
+  -ua <UA>             自定义 User-Agent (默认与米哈游启动器一致: ` + defaultUA + `)
   -list                只打印资源列表后退出
   -v, -version         显示版本
 
 示例:
-  traffickiller                              # 不限速，8 并发，一直跑
+  traffickiller                              # 不限速，32 并发，一直跑
   traffickiller -i eth1 -c 16 -l 200M        # 从 eth1 下载，16 并发，限速 200Mbps
   traffickiller -l 50M -t 300G               # 限速 50Mbps，跑满 300GB 后退出
   traffickiller -i pppoe-wan -d 6h -g ys,zzz # 只下载原神和绝区零，跑 6 小时
@@ -61,17 +66,17 @@ func main() { os.Exit(run()) }
 
 func run() int {
 	var (
-		iface, limitStr, totalStr, games, urlFile string
-		conc                                      int
-		dur, interval                             time.Duration
-		all, prefer6, plainHTTP, list, showVer    bool
+		iface, limitStr, totalStr, games, urlFile, ua string
+		conc                                          int
+		dur, interval                                 time.Duration
+		all, prefer6, plainHTTP, list, showVer        bool
 	)
 	fs := flag.CommandLine
 	for _, n := range []string{"i", "iface"} {
 		fs.StringVar(&iface, n, "", "")
 	}
 	for _, n := range []string{"c", "conc"} {
-		fs.IntVar(&conc, n, 8, "")
+		fs.IntVar(&conc, n, 32, "")
 	}
 	for _, n := range []string{"l", "limit"} {
 		fs.StringVar(&limitStr, n, "0", "")
@@ -96,9 +101,10 @@ func run() int {
 	fs.BoolVar(&plainHTTP, "http", false, "")
 	fs.BoolVar(&list, "list", false, "")
 	fs.DurationVar(&interval, "interval", 0, "")
+	fs.StringVar(&ua, "ua", defaultUA, "")
 	fs.Usage = func() { fmt.Fprintf(os.Stderr, usage, version) }
 	flag.Parse()
-	userAgent = "traffickiller/" + version
+	userAgent = ua
 
 	if showVer {
 		fmt.Println(version)
@@ -155,10 +161,11 @@ func run() int {
 	}
 	if len(urls) > 0 {
 		g := &group{name: "自定义", desc: fmt.Sprintf("%d 个 URL", len(urls))}
-		direct := &urlParts{}
+		b := newSourceBuilder("", "", len(urls))
 		for _, u := range urls {
-			g.items = append(g.items, item{parts: direct, name: u})
+			b.add([]byte(u), 0)
 		}
+		g.add(b.build())
 		groups = append(groups, g)
 	} else {
 		con.logf("正在获取资源列表...")
@@ -171,10 +178,17 @@ func run() int {
 		return fail("没有可用的资源")
 	}
 	debug.FreeOSMemory() // 解析清单产生的临时内存还给系统，常驻内存更低
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(25) // 运行期分配很少，调低 GC 目标换更低的常驻内存
+	}
 	if list {
+		w := bufio.NewWriter(os.Stdout)
+		defer w.Flush()
 		for _, g := range groups {
-			for _, it := range g.items {
-				fmt.Println(it.url())
+			for _, s := range g.sources {
+				for _, sp := range s.items {
+					w.WriteString(s.url(sp) + "\n")
+				}
 			}
 		}
 		return 0
