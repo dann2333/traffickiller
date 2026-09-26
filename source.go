@@ -1,0 +1,432 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// 资源列表来自 https://hoyo-files.amarea.cn/ ，实际文件都在米哈游官方 CDN 上。
+const apiBase = "https://autopatch.amarea.cn/pkg_version"
+
+// 每个游戏最多保留的分块数（随机抽样），约 20GB 不重复数据，够用且省内存。
+const maxChunks = 20000
+
+var gameIDs = []string{"hk4e", "hkrpg", "nap", "bh3"}
+
+var gameNames = map[string]string{"hk4e": "原神", "hkrpg": "星穹铁道", "nap": "绝区零", "bh3": "崩坏3"}
+
+var gameAlias = map[string]string{
+	"ys": "hk4e", "genshin": "hk4e", "原神": "hk4e",
+	"sr": "hkrpg", "starrail": "hkrpg", "星铁": "hkrpg", "星穹铁道": "hkrpg",
+	"zzz": "nap", "绝区零": "nap",
+	"honkai": "bh3", "崩坏3": "bh3",
+}
+
+func parseGames(s string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, g := range strings.Split(s, ",") {
+		g = strings.ToLower(strings.TrimSpace(g))
+		if g == "" {
+			continue
+		}
+		if g == "all" {
+			return gameIDs, nil
+		}
+		if a, ok := gameAlias[g]; ok {
+			g = a
+		}
+		if _, ok := gameNames[g]; !ok {
+			return nil, fmt.Errorf("未知游戏 %q，可选: %s", g, strings.Join(gameIDs, ","))
+		}
+		if !seen[g] {
+			seen[g] = true
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
+// loadGames 并行获取各游戏的资源列表。
+func loadGames(ctx context.Context, c *http.Client, games []string, all bool) []*group {
+	res := make([]*group, len(games))
+	var wg sync.WaitGroup
+	for i, id := range games {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g, err := loadGame(ctx, c, id, all)
+			if err != nil {
+				if ctx.Err() == nil {
+					con.logf("%s: 获取资源列表失败: %v", gameNames[id], err)
+				}
+				return
+			}
+			res[i] = g
+		}()
+	}
+	wg.Wait()
+	var out []*group
+	for _, g := range res {
+		if g != nil && len(g.items) > 0 {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group, error) {
+	var vers map[string]any
+	if err := getJSON(ctx, c, apiBase+"/"+id+"_versions.json", &vers); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(vers))
+	for k := range vers {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return verLess(keys[j], keys[i]) }) // 新版本在前
+
+	g := &group{name: gameNames[id]}
+	direct := &urlParts{}
+	seen := map[string]bool{}
+	add := func(u string, size int64) {
+		if !seen[u] {
+			seen[u] = true
+			g.items = append(g.items, item{parts: direct, name: u, size: size})
+		}
+	}
+
+	if all {
+		for _, k := range keys {
+			collectURLs(vers[k], add)
+		}
+		g.desc = fmt.Sprintf("全部版本 %d 个整包", len(g.items))
+		return g, nil
+	}
+
+	// 最新版本：优先整包，没有整包则用 Sophon 分块（当前正式版 main 分支）。
+	for _, k := range keys {
+		collectURLs(vers[k], add)
+		if len(g.items) > 0 {
+			g.desc = fmt.Sprintf("%s 整包 %d 个", k, len(g.items))
+			return g, nil
+		}
+		if e, _ := vers[k].(map[string]any); e != nil {
+			if ch, _ := e["chunk"].(map[string]any); ch != nil && ch["branch"] == "main" {
+				return g, loadSophon(ctx, c, id, k, g)
+			}
+		}
+	}
+	return nil, errors.New("没有找到可下载的版本")
+}
+
+// collectURLs 递归找出所有 {"url": ..., "size": ...} 对象。
+func collectURLs(v any, fn func(string, int64)) {
+	switch x := v.(type) {
+	case map[string]any:
+		if u, ok := x["url"].(string); ok && strings.HasPrefix(u, "http") {
+			if s, ok := x["size"].(float64); ok {
+				fn(u, int64(s))
+			}
+		}
+		for _, e := range x {
+			collectURLs(e, fn)
+		}
+	case []any:
+		for _, e := range x {
+			collectURLs(e, fn)
+		}
+	}
+}
+
+// verLess 比较 "7.1.0" 这类版本号。
+func verLess(a, b string) bool {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		var x, y int
+		if i < len(as) {
+			x, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			y, _ = strconv.Atoi(bs[i])
+		}
+		if x != y {
+			return x < y
+		}
+	}
+	return a < b
+}
+
+type sophonDL struct {
+	Encryption  int    `json:"encryption"`
+	Compression int    `json:"compression"`
+	URLPrefix   string `json:"url_prefix"`
+	URLSuffix   string `json:"url_suffix"`
+}
+
+type sophonBuild struct {
+	Data struct {
+		Manifests []struct {
+			Field    string `json:"matching_field"`
+			Manifest struct {
+				ID string `json:"id"`
+			} `json:"manifest"`
+			ChunkDL    sophonDL `json:"chunk_download"`
+			ManifestDL sophonDL `json:"manifest_download"`
+			Stats      struct {
+				Size string `json:"compressed_size"`
+			} `json:"stats"`
+		} `json:"manifests"`
+	} `json:"data"`
+}
+
+// loadSophon 读取该版本最大的 Sophon 清单，随机抽取最多 maxChunks 个分块。
+func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) error {
+	var b sophonBuild
+	if err := getJSON(ctx, c, fmt.Sprintf("%s/chunk/%s_%s.json", apiBase, id, tag), &b); err != nil {
+		return err
+	}
+	best, bestSize := -1, int64(-1)
+	for i, m := range b.Data.Manifests {
+		s, _ := strconv.ParseInt(m.Stats.Size, 10, 64)
+		if m.ManifestDL.Encryption == 0 && s > bestSize {
+			best, bestSize = i, s
+		}
+	}
+	if best < 0 {
+		return errors.New("没有可用的分块清单")
+	}
+	m := b.Data.Manifests[best]
+	parts := &urlParts{prefix: m.ChunkDL.URLPrefix + "/", suffix: m.ChunkDL.URLSuffix}
+	murl := m.ManifestDL.URLPrefix + "/" + m.Manifest.ID + m.ManifestDL.URLSuffix
+
+	var total int
+	err := retry(ctx, func() error {
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer cancel()
+		resp, err := get(ctx, c, murl)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		var r io.Reader = resp.Body
+		if m.ManifestDL.Compression == 1 {
+			zr, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+			if err != nil {
+				return err
+			}
+			defer zr.Close()
+			r = zr
+		}
+		g.items, total = g.items[:0], 0
+		return parseManifest(r, func(name []byte, size int64) {
+			total++
+			it := item{parts: parts, size: size}
+			if len(g.items) < maxChunks {
+				it.name = string(name)
+				g.items = append(g.items, it)
+			} else if j := rand.IntN(total); j < maxChunks {
+				it.name = string(name)
+				g.items[j] = it
+			}
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("读取分块清单失败: %w", err)
+	}
+	g.desc = fmt.Sprintf("%s 分块 %d/%d 个 (%s)", tag, len(g.items), total, m.Field)
+	return nil
+}
+
+var errBadManifest = errors.New("清单格式错误")
+
+// parseManifest 流式解析 Sophon 清单 (protobuf)：
+// Manifest{ repeated Asset = 1 }，Asset{ name = 1; repeated Chunk = 2 }，
+// Chunk{ name = 1; md5 = 2; offset = 3; size = 4; ... }。
+func parseManifest(r io.Reader, fn func(name []byte, size int64)) error {
+	br := bufio.NewReaderSize(r, 64<<10)
+	var buf []byte
+	for {
+		key, err := binary.ReadUvarint(br)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var n uint64
+		switch key & 7 {
+		case 0:
+			_, err = binary.ReadUvarint(br)
+			if err != nil {
+				return err
+			}
+			continue
+		case 1:
+			n = 8
+		case 5:
+			n = 4
+		case 2:
+			if n, err = binary.ReadUvarint(br); err != nil {
+				return err
+			}
+			if n > 64<<20 {
+				return errBadManifest
+			}
+		default:
+			return errBadManifest
+		}
+		if uint64(cap(buf)) < n {
+			buf = make([]byte, n)
+		}
+		buf = buf[:n]
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return err
+		}
+		if key != 1<<3|2 {
+			continue
+		}
+		err = pbFields(buf, func(f int, _ uint64, chunk []byte) error {
+			if f != 2 || chunk == nil {
+				return nil
+			}
+			var name []byte
+			var size int64
+			if err := pbFields(chunk, func(f int, v uint64, b []byte) error {
+				switch f {
+				case 1:
+					name = b
+				case 4:
+					size = int64(v)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if len(name) > 0 {
+				fn(name, size)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// pbFields 遍历一条 protobuf 消息的字段；varint 字段给出 v，长度字段给出 b。
+func pbFields(msg []byte, fn func(field int, v uint64, b []byte) error) error {
+	for len(msg) > 0 {
+		key, n := binary.Uvarint(msg)
+		if n <= 0 {
+			return errBadManifest
+		}
+		msg = msg[n:]
+		var v uint64
+		var b []byte
+		switch key & 7 {
+		case 0:
+			if v, n = binary.Uvarint(msg); n <= 0 {
+				return errBadManifest
+			}
+			msg = msg[n:]
+		case 1, 5:
+			w := 8
+			if key&7 == 5 {
+				w = 4
+			}
+			if len(msg) < w {
+				return errBadManifest
+			}
+			msg = msg[w:]
+			continue
+		case 2:
+			l, n := binary.Uvarint(msg)
+			if n <= 0 || l > uint64(len(msg)-n) {
+				return errBadManifest
+			}
+			b, msg = msg[n:n+int(l)], msg[n+int(l):]
+		default:
+			return errBadManifest
+		}
+		if err := fn(int(key>>3), v, b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadURLFile 读取 URL 列表文件，每行一个，# 开头为注释。
+func loadURLFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			out = append(out, line)
+		}
+	}
+	return out, nil
+}
+
+func get(ctx context.Context, c *http.Client, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+func getJSON(ctx context.Context, c *http.Client, url string, v any) error {
+	return retry(ctx, func() error {
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		resp, err := get(ctx, c, url)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		return json.NewDecoder(resp.Body).Decode(v)
+	})
+}
+
+// retry 最多尝试 3 次，间隔 2s、4s。
+func retry(ctx context.Context, fn func() error) error {
+	var err error
+	for i := range 3 {
+		if i > 0 && !sleep(ctx, time.Duration(1<<i)*time.Second) {
+			return ctx.Err()
+		}
+		if err = fn(); err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
+}
