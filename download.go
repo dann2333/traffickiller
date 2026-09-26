@@ -203,7 +203,7 @@ type downloader struct {
 	active atomic.Int32
 }
 
-func (d *downloader) worker(ctx context.Context, c *http.Client) {
+func (d *downloader) worker(ctx context.Context, c *http.Client, ua string) {
 	buf := make([]byte, 64<<10)
 	backoff := time.Second
 	for ctx.Err() == nil {
@@ -216,7 +216,7 @@ func (d *downloader) worker(ctx context.Context, c *http.Client) {
 		if d.plainHTTP && strings.HasPrefix(u, "https://") {
 			u = "http://" + u[len("https://"):]
 		}
-		err := d.fetch(ctx, c, u, buf)
+		err := d.fetch(ctx, c, u, ua, buf)
 		if ctx.Err() != nil {
 			return
 		}
@@ -238,14 +238,14 @@ func (d *downloader) worker(ctx context.Context, c *http.Client) {
 }
 
 // fetch 下载一个文件，数据读进缓冲区后直接丢弃。
-func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, buf []byte) error {
+func (d *downloader) fetch(ctx context.Context, c *http.Client, u, ua string, buf []byte) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", ua)
 	resp, err := c.Do(req)
 	if err != nil {
 		return err

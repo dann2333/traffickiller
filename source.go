@@ -421,7 +421,7 @@ func get(ctx context.Context, c *http.Client, url string) (*http.Response, error
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", randomUA())
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err

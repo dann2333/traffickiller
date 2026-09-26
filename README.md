@@ -5,7 +5,7 @@
 - 可指定出口网卡（支持多网卡 / 多拨）
 - 可控并发数、总带宽上限、总流量、运行时长
 - 单文件静态二进制，无运行依赖；实测 64 并发跑到约 5Gbps，占用约 0.6 个 CPU 核、55MB 内存
-- User-Agent 默认与米哈游启动器一致 (`HYPContainer/1.10.1.283 (windows 10)`)
+- 默认使用多个米哈游启动器 (HoYoPlay) 的真实 UA，每个连接随机分配一个，见 [User-Agent](#user-agent)
 - 资源列表来自 [hoyo-files.amarea.cn](https://hoyo-files.amarea.cn/)，失效链接自动剔除
 
 ## 下载
@@ -49,7 +49,8 @@ traffickiller [选项] [URL...]
   -6                   绑定网卡时优先使用 IPv6 地址
   -http                CDN 下载改用 HTTP 而非 HTTPS，省去 TLS 解密开销 (适合路由器等弱 CPU 设备)
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
-  -ua <UA>             自定义 User-Agent (默认与米哈游启动器一致)
+  -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
+                       默认使用几个米哈游启动器的 UA (HYPContainer/...)
   -list                只打印资源列表后退出
   -v, -version         显示版本
 ```
@@ -88,6 +89,19 @@ traffickiller -i 以太网 -l 100M             # Windows 下用网卡名称（�
 - `-i eth0`：使用该网卡的 IPv4 地址作为源地址；Linux 下同时用 `SO_BINDTODEVICE` 强制从该网卡发出（内核 5.7 以下需 root），macOS 用 `IP_BOUND_IF`，其他系统仅按源地址绑定。
 - `-i 192.168.1.10`：直接指定源 IP。
 - `-i pppoe-wan,pppoe-wan2`：多拨/多线，连接轮流分配到各网卡，`-l` 是所有网卡合计的上限。
+
+## User-Agent
+
+米哈游启动器 (HoYoPlay) 的 UA 格式是 `HYPContainer/<启动器版本>`。默认内置以下几个在社区项目中使用的真实 UA，每个下载连接启动时随机分配一个，并使用独立的连接池（同一条 TCP 连接始终是同一个 UA，看起来像多个独立客户端）：
+
+| UA | 出处 |
+| --- | --- |
+| `HYPContainer/1.10.1.283 (windows 10)` | [Collapse Launcher](https://github.com/CollapseLauncher/Collapse) 模拟启动器资源接口 |
+| `HYPContainer/1.10.1.283 (windows 11)` | 同上（Windows 11 机器） |
+| `HYPContainer/1.3.3.182` | [gsuid_core](https://github.com/Genshin-bots/gsuid_core)、[TeyvatGuide](https://github.com/BTMuli/TeyvatGuide)、AUTO-MAS |
+| `HYPContainer/1.1.4.133` | Snap.Hutao、FufuLauncher、sigewinne-toolkit |
+
+想换成自己的列表：`traffickiller -ua "UA1" -ua "UA2" -ua "UA3"`。
 
 ## 跑满高带宽（数 Gbps）
 

@@ -89,7 +89,7 @@ func listIfaces() string {
 }
 
 // client 为该出口创建 HTTP 客户端。强制 HTTP/1.1，保证每个并发都是独立的 TCP 连接。
-func (e egress) client(conc int) *http.Client {
+func (e egress) client(idlePerHost int) *http.Client {
 	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	network := "tcp"
 	if e.ip != nil {
@@ -109,8 +109,8 @@ func (e egress) client(conc int) *http.Client {
 		},
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 20 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConnsPerHost:   conc,
+		IdleConnTimeout:       30 * time.Second,
+		MaxIdleConnsPerHost:   idlePerHost,
 		DisableCompression:    true,
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
 	}

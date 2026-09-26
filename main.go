@@ -7,7 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/http"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -19,10 +19,28 @@ import (
 
 var version = "dev"
 
-// 默认 UA 与米哈游启动器 (HoYoPlay) 下载资源时一致。
-const defaultUA = "HYPContainer/1.10.1.283 (windows 10)"
+// 默认 UA 均为社区项目里使用的米哈游启动器 (HoYoPlay) 真实 UA，每个连接随机分配一个：
+//
+//	HYPContainer/1.10.1.283 (windows 10/11)  Collapse Launcher（模拟启动器资源接口）
+//	HYPContainer/1.3.3.182                   gsuid_core、TeyvatGuide、AUTO-MAS
+//	HYPContainer/1.1.4.133                   Snap.Hutao、FufuLauncher、sigewinne-toolkit
+var defaultUAs = []string{
+	"HYPContainer/1.10.1.283 (windows 10)",
+	"HYPContainer/1.10.1.283 (windows 11)",
+	"HYPContainer/1.3.3.182",
+	"HYPContainer/1.1.4.133",
+}
 
-var userAgent string
+// userAgents 是实际使用的 UA 列表（-ua 指定或默认）。
+var userAgents = defaultUAs
+
+func randomUA() string { return userAgents[rand.IntN(len(userAgents))] }
+
+// listFlag 支持重复指定的参数，如 -ua A -ua B。
+type listFlag []string
+
+func (l *listFlag) String() string     { return strings.Join(*l, " | ") }
+func (l *listFlag) Set(v string) error { *l = append(*l, v); return nil }
 
 var (
 	errInterrupted  = errors.New("收到退出信号")
@@ -51,7 +69,8 @@ const usage = `traffickiller %s - 流量消耗器
   -6                   绑定网卡时优先使用 IPv6 地址
   -http                CDN 下载改用 HTTP 而非 HTTPS，省去 TLS 解密开销 (适合路由器等弱 CPU 设备)
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
-  -ua <UA>             自定义 User-Agent (默认与米哈游启动器一致: ` + defaultUA + `)
+  -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
+                       默认使用几个米哈游启动器的 UA (HYPContainer/...)
   -list                只打印资源列表后退出
   -v, -version         显示版本
 
@@ -66,10 +85,11 @@ func main() { os.Exit(run()) }
 
 func run() int {
 	var (
-		iface, limitStr, totalStr, games, urlFile, ua string
-		conc                                          int
-		dur, interval                                 time.Duration
-		all, prefer6, plainHTTP, list, showVer        bool
+		iface, limitStr, totalStr, games, urlFile string
+		uas                                       listFlag
+		conc                                      int
+		dur, interval                             time.Duration
+		all, prefer6, plainHTTP, list, showVer    bool
 	)
 	fs := flag.CommandLine
 	for _, n := range []string{"i", "iface"} {
@@ -101,10 +121,12 @@ func run() int {
 	fs.BoolVar(&plainHTTP, "http", false, "")
 	fs.BoolVar(&list, "list", false, "")
 	fs.DurationVar(&interval, "interval", 0, "")
-	fs.StringVar(&ua, "ua", defaultUA, "")
+	fs.Var(&uas, "ua", "")
 	fs.Usage = func() { fmt.Fprintf(os.Stderr, usage, version) }
 	flag.Parse()
-	userAgent = ua
+	if len(uas) > 0 {
+		userAgents = uas
+	}
 
 	if showVer {
 		fmt.Println(version)
@@ -132,10 +154,6 @@ func run() int {
 	egs, err := parseEgress(iface, prefer6)
 	if err != nil {
 		return fail("%v", err)
-	}
-	clients := make([]*http.Client, len(egs))
-	for i, e := range egs {
-		clients[i] = e.client(conc)
 	}
 
 	ctx, stop := context.WithCancelCause(context.Background())
@@ -169,7 +187,7 @@ func run() int {
 		groups = append(groups, g)
 	} else {
 		con.logf("正在获取资源列表...")
-		groups = loadGames(ctx, clients[0], gameList, all)
+		groups = loadGames(ctx, egs[0].client(4), gameList, all)
 	}
 	if ctx.Err() != nil {
 		return 130
@@ -209,8 +227,8 @@ func run() int {
 	if dur > 0 {
 		durDesc = dur.String()
 	}
-	con.logf("traffickiller %s | 出口: %s | 并发: %d | 限速: %s | 总量: %s | 时长: %s",
-		version, strings.Join(labels, ", "), conc, limitDesc, totalDesc, durDesc)
+	con.logf("traffickiller %s | 出口: %s | 并发: %d | 限速: %s | 总量: %s | 时长: %s | UA: %d 个随机分配",
+		version, strings.Join(labels, ", "), conc, limitDesc, totalDesc, durDesc, len(userAgents))
 	for _, g := range groups {
 		if sz := g.bytes(); sz > 0 {
 			con.logf("  %s: %s, 共 %s", g.name, g.desc, fmtBytes(float64(sz)))
@@ -230,12 +248,16 @@ func run() int {
 		time.AfterFunc(dur, func() { stop(errDuration) })
 	}
 	start := time.Now()
+	// 每个连接有独立的连接池和固定的 UA，看起来像多个独立的客户端。
 	var wg sync.WaitGroup
+	uaOff := rand.IntN(len(userAgents))
 	for i := range conc {
+		c := egs[i%len(egs)].client(1)
+		ua := userAgents[(uaOff+i)%len(userAgents)]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.worker(ctx, clients[i%len(clients)])
+			d.worker(ctx, c, ua)
 		}()
 	}
 	if interval <= 0 {
