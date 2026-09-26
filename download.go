@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"slices"
 	"strings"
@@ -21,6 +22,7 @@ type span struct{ off, n uint32 }
 // source 是一批共享 URL 前后缀的文件。几十万个文件名紧凑地存放在一个字符串里，
 // 每个文件只额外占 8 字节，保留全部分块也只需十几 MB 内存。
 type source struct {
+	label          string // 界面上显示的类型，如 本体 / 语音 zh-cn / 整包
 	prefix, suffix string
 	names          string
 	items          []span
@@ -31,14 +33,26 @@ func (s *source) url(sp span) string {
 	return s.prefix + s.names[sp.off:sp.off+sp.n] + s.suffix
 }
 
+// name 返回界面上显示的文件名：分块名，或完整 URL 的最后一段。
+func (s *source) name(sp span) string {
+	n := s.names[sp.off : sp.off+sp.n]
+	if s.prefix == "" {
+		if i := strings.IndexAny(n, "?#"); i >= 0 {
+			n = n[:i]
+		}
+		n = n[strings.LastIndexByte(strings.TrimRight(n, "/"), '/')+1:]
+	}
+	return n
+}
+
 // sourceBuilder 逐个追加文件来构建 source。
 type sourceBuilder struct {
 	src   source
 	names strings.Builder
 }
 
-func newSourceBuilder(prefix, suffix string, sizeHint int) *sourceBuilder {
-	b := &sourceBuilder{src: source{prefix: prefix, suffix: suffix, items: make([]span, 0, sizeHint)}}
+func newSourceBuilder(label, prefix, suffix string, sizeHint int) *sourceBuilder {
+	b := &sourceBuilder{src: source{label: label, prefix: prefix, suffix: suffix, items: make([]span, 0, sizeHint)}}
 	b.names.Grow(sizeHint * 50)
 	return b
 }
@@ -61,6 +75,10 @@ type group struct {
 	sources []*source
 	count   int // 文件总数
 	fails   int // 连续失效 (403/404/410) 次数
+
+	got  atomic.Int64 // 已下载字节
+	done atomic.Int64 // 已下载完的文件数
+	off  atomic.Bool  // 已停用
 }
 
 func (g *group) add(s *source) {
@@ -122,6 +140,7 @@ func (p *pool) report(g *group, s *source, sp span, gone bool) bool {
 	}
 	if i := slices.Index(p.groups, g); i >= 0 {
 		p.groups = slices.Delete(p.groups, i, i+1)
+		g.off.Store(true)
 		return true
 	}
 	return false
@@ -200,10 +219,54 @@ type downloader struct {
 	stop      context.CancelCauseFunc
 
 	total  atomic.Int64
+	done   atomic.Int64 // 已下载完的文件数
 	active atomic.Int32
 }
 
-func (d *downloader) worker(ctx context.Context, c *http.Client, ua string) {
+type connState int
+
+const (
+	stIdle     connState = iota
+	stRequest            // 已发出请求，等待响应
+	stDownload           // 正在接收数据
+	stBackoff            // 出错后等待重试
+)
+
+// conn 是一个下载连接的实时状态，供界面展示。
+type conn struct {
+	ua    string
+	trace *httptrace.ClientTrace
+
+	n   atomic.Int64 // 该连接累计下载字节
+	cur atomic.Int64 // 当前文件已下载字节
+
+	mu    sync.Mutex
+	state connState
+	g     *group
+	kind  string    // 资源类型
+	file  string    // 文件名
+	size  int64     // 当前文件大小，未知为 -1
+	addr  string    // 服务器 IP:端口（经代理时是代理的地址）
+	until time.Time // 重试等待截止时间
+	err   string    // 最近一次错误
+}
+
+func newConn(ua string) *conn {
+	st := &conn{ua: ua}
+	st.trace = &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
+		addr := i.Conn.RemoteAddr().String()
+		st.set(func(st *conn) { st.addr = addr })
+	}}
+	return st
+}
+
+func (st *conn) set(f func(st *conn)) {
+	st.mu.Lock()
+	f(st)
+	st.mu.Unlock()
+}
+
+func (d *downloader) worker(ctx context.Context, c *http.Client, st *conn) {
 	buf := make([]byte, 64<<10)
 	backoff := time.Second
 	for ctx.Err() == nil {
@@ -216,7 +279,11 @@ func (d *downloader) worker(ctx context.Context, c *http.Client, ua string) {
 		if d.plainHTTP && strings.HasPrefix(u, "https://") {
 			u = "http://" + u[len("https://"):]
 		}
-		err := d.fetch(ctx, c, u, ua, buf)
+		st.cur.Store(0)
+		st.set(func(st *conn) {
+			st.state, st.g, st.kind, st.file, st.size, st.err = stRequest, g, s.label, s.name(sp), -1, ""
+		})
+		err := d.fetch(ctx, c, u, g, st, buf)
 		if ctx.Err() != nil {
 			return
 		}
@@ -225,11 +292,17 @@ func (d *downloader) worker(ctx context.Context, c *http.Client, ua string) {
 		if d.pool.report(g, s, sp, gone) {
 			con.logf("%s: 资源连续失效 (%v)，已停用该来源", g.name, err)
 		}
+		if err == nil {
+			d.done.Add(1)
+			g.done.Add(1)
+		}
 		if err == nil || gone {
 			backoff = time.Second
 			continue
 		}
-		con.logf("%s 下载出错: %v", host(u), shortErr(err))
+		e := shortErr(err).Error()
+		con.logf("%s 下载出错: %s", host(u), e)
+		st.set(func(st *conn) { st.state, st.until, st.err = stBackoff, time.Now().Add(backoff), e })
 		if !sleep(ctx, backoff) {
 			return
 		}
@@ -238,14 +311,14 @@ func (d *downloader) worker(ctx context.Context, c *http.Client, ua string) {
 }
 
 // fetch 下载一个文件，数据读进缓冲区后直接丢弃。
-func (d *downloader) fetch(ctx context.Context, c *http.Client, u, ua string, buf []byte) error {
+func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, g *group, st *conn, buf []byte) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, st.trace), http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", ua)
+	req.Header.Set("User-Agent", st.ua)
 	resp, err := c.Do(req)
 	if err != nil {
 		return err
@@ -254,6 +327,7 @@ func (d *downloader) fetch(ctx context.Context, c *http.Client, u, ua string, bu
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return statusError(resp.StatusCode)
 	}
+	st.set(func(st *conn) { st.state, st.size = stDownload, resp.ContentLength })
 
 	d.active.Add(1)
 	defer d.active.Add(-1)
@@ -272,6 +346,9 @@ func (d *downloader) fetch(ctx context.Context, c *http.Client, u, ua string, bu
 		d.lim.refund(len(buf) - n)
 		if n > 0 {
 			watchdog.Reset(stallTimeout)
+			st.n.Add(int64(n))
+			st.cur.Add(int64(n))
+			g.got.Add(int64(n))
 			if v := d.total.Add(int64(n)); d.maxTotal > 0 && v >= d.maxTotal {
 				d.stop(errTotalReached)
 				return nil

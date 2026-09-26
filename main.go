@@ -8,9 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -68,6 +70,8 @@ const usage = `traffickiller %s - 流量消耗器
   -f, -file <文件>     从文件读取 URL 列表 (每行一个)，替代内置资源；也可直接在参数末尾写 URL
   -6                   绑定网卡时优先使用 IPv6 地址
   -http                CDN 下载改用 HTTP 而非 HTTPS，省去 TLS 解密开销 (适合路由器等弱 CPU 设备)
+  -plain               不用全屏界面，只输出单行状态 (输出不是终端时自动如此)
+  -nogeo               界面上不查询服务器 IP 属地 (默认通过百度 / ip-api.com 查询)
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
   -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
                        默认使用几个米哈游启动器的 UA (HYPContainer/...)
@@ -90,6 +94,7 @@ func run() int {
 		conc                                      int
 		dur, interval                             time.Duration
 		all, prefer6, plainHTTP, list, showVer    bool
+		plain, noGeo                              bool
 	)
 	fs := flag.CommandLine
 	for _, n := range []string{"i", "iface"} {
@@ -120,6 +125,8 @@ func run() int {
 	fs.BoolVar(&prefer6, "6", false, "")
 	fs.BoolVar(&plainHTTP, "http", false, "")
 	fs.BoolVar(&list, "list", false, "")
+	fs.BoolVar(&plain, "plain", false, "")
+	fs.BoolVar(&noGeo, "nogeo", false, "")
 	fs.DurationVar(&interval, "interval", 0, "")
 	fs.Var(&uas, "ua", "")
 	fs.Usage = func() { fmt.Fprintf(os.Stderr, usage, version) }
@@ -164,6 +171,7 @@ func run() int {
 		<-sig
 		stop(errInterrupted)
 		<-sig
+		con.stopUI()
 		os.Exit(130)
 	}()
 
@@ -179,7 +187,7 @@ func run() int {
 	}
 	if len(urls) > 0 {
 		g := &group{name: "自定义", desc: fmt.Sprintf("%d 个 URL", len(urls))}
-		b := newSourceBuilder("", "", len(urls))
+		b := newSourceBuilder("URL", "", "", len(urls))
 		for _, u := range urls {
 			b.add([]byte(u), 0)
 		}
@@ -237,8 +245,10 @@ func run() int {
 		}
 	}
 
+	proxy := proxyFor(groups, plainHTTP) // 须在下载开始、资源列表被改动之前取
+
 	d := &downloader{
-		pool:      &pool{groups: groups},
+		pool:      &pool{groups: slices.Clone(groups)}, // 界面持有原列表，停用的游戏仍会显示
 		lim:       newLimiter(rate),
 		plainHTTP: plainHTTP,
 		maxTotal:  maxTotal,
@@ -250,14 +260,16 @@ func run() int {
 	start := time.Now()
 	// 每个连接有独立的连接池和固定的 UA，看起来像多个独立的客户端。
 	var wg sync.WaitGroup
+	conns := make([]*conn, conc)
 	uaOff := rand.IntN(len(userAgents))
 	for i := range conc {
 		c := egs[i%len(egs)].client(1)
-		ua := userAgents[(uaOff+i)%len(userAgents)]
+		st := newConn(userAgents[(uaOff+i)%len(userAgents)])
+		conns[i] = st
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.worker(ctx, c, ua)
+			d.worker(ctx, c, st)
 		}()
 	}
 	if interval <= 0 {
@@ -266,8 +278,22 @@ func run() int {
 			interval = time.Second
 		}
 	}
-	go d.report(ctx, start, interval, conc)
+	if !plain && con.startUI() {
+		info := fmt.Sprintf("出口 %s | 限速 %s | 总量 %s | UA %d 个", strings.Join(labels, ", "), limitDesc, totalDesc, len(userAgents))
+		if proxy != "" {
+			info += " | 经代理 " + proxy + " (服务器列为代理地址)"
+		}
+		var geo *geoCache
+		if !noGeo {
+			geo = newGeoCache(egs[0].client(2))
+			go geo.run(ctx)
+		}
+		go newTUI(d, groups, conns, start, dur, info, geo).run(ctx, interval)
+	} else {
+		go d.report(ctx, start, interval, conc)
+	}
 	wg.Wait()
+	con.stopUI()
 
 	cause := context.Cause(ctx)
 	el := time.Since(start)
@@ -278,6 +304,23 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// proxyFor 返回下载会经过的代理（来自 HTTPS_PROXY 等环境变量），没有则为空。
+func proxyFor(groups []*group, plainHTTP bool) string {
+	s := groups[0].sources[0]
+	u := s.url(s.items[0])
+	if plainHTTP && strings.HasPrefix(u, "https://") {
+		u = "http://" + u[len("https://"):]
+	}
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	if p, err := http.ProxyFromEnvironment(req); err == nil && p != nil {
+		return p.Host
+	}
+	return ""
 }
 
 // report 周期性输出速率和累计流量。
@@ -305,54 +348,4 @@ func (d *downloader) report(ctx context.Context, start time.Time, every time.Dur
 			con.status(s)
 		}
 	}
-}
-
-// console 在终端上用 \r 原地刷新状态行，日志行不会与状态行混在一起。
-type console struct {
-	mu   sync.Mutex
-	tty  bool
-	last int
-}
-
-var con = newConsole()
-
-func newConsole() *console {
-	fi, err := os.Stderr.Stat()
-	return &console{tty: err == nil && fi.Mode()&os.ModeCharDevice != 0}
-}
-
-func (c *console) status(s string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tty {
-		fmt.Fprintln(os.Stderr, s)
-		return
-	}
-	w := width(s)
-	fmt.Fprint(os.Stderr, "\r"+s+strings.Repeat(" ", max(c.last-w, 0)))
-	c.last = w
-}
-
-func (c *console) logf(format string, a ...any) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	s := time.Now().Format("15:04:05 ") + fmt.Sprintf(format, a...)
-	if c.tty && c.last > 0 {
-		s = "\r" + s + strings.Repeat(" ", max(c.last-width(s), 0))
-		c.last = 0
-	}
-	fmt.Fprintln(os.Stderr, s)
-}
-
-// width 估算终端显示宽度（中文占两格）。
-func width(s string) int {
-	n := 0
-	for _, r := range s {
-		if r >= 0x2E80 {
-			n += 2
-		} else {
-			n++
-		}
-	}
-	return n
 }

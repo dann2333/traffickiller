@@ -104,7 +104,7 @@ func TestParseManifest(t *testing.T) {
 }
 
 func TestSourceBuilder(t *testing.T) {
-	b := newSourceBuilder("https://cdn/x/", "?s", 2)
+	b := newSourceBuilder("", "https://cdn/x/", "?s", 2)
 	b.add([]byte("aa"), 10)
 	b.add([]byte("bbb"), 20)
 	src := b.build()
@@ -119,7 +119,7 @@ func TestSourceBuilder(t *testing.T) {
 func TestPoolDropsDeadSource(t *testing.T) {
 	g := &group{name: "x"}
 	for range 2 {
-		b := newSourceBuilder("", "", 0)
+		b := newSourceBuilder("", "", "", 0)
 		for i := range 10 {
 			b.add([]byte{byte('a' + i)}, 1)
 		}
@@ -155,7 +155,7 @@ func TestPoolDropsDeadSource(t *testing.T) {
 func TestPoolEmptiesSource(t *testing.T) {
 	g := &group{name: "x"}
 	for _, n := range []int{1, 3} {
-		b := newSourceBuilder("", "", 0)
+		b := newSourceBuilder("", "", "", 0)
 		for i := range n {
 			b.add([]byte{byte('a' + i)}, 1)
 		}
@@ -171,5 +171,80 @@ func TestPoolEmptiesSource(t *testing.T) {
 		if _, s, _, _ := p.pick(); s == small {
 			t.Fatal("picked from emptied source")
 		}
+	}
+}
+
+func TestSourceName(t *testing.T) {
+	b := newSourceBuilder("", "", "", 2)
+	b.add([]byte("https://cdn.example.com/a/b/game_1.0.zip.001?x=1"), 1)
+	b.add([]byte("https://cdn.example.com/dir/"), 1)
+	src := b.build()
+	if got := src.name(src.items[0]); got != "game_1.0.zip.001" {
+		t.Errorf("name = %q", got)
+	}
+	if got := src.name(src.items[1]); got != "dir/" {
+		t.Errorf("name = %q", got)
+	}
+	c := newSourceBuilder("本体", "https://cdn/chunks/", "", 1)
+	c.add([]byte("4af6307d_a1c9"), 1)
+	if cs := c.build(); cs.name(cs.items[0]) != "4af6307d_a1c9" {
+		t.Errorf("chunk name = %q", cs.name(cs.items[0]))
+	}
+}
+
+func TestFitClip(t *testing.T) {
+	cases := []struct {
+		in   string
+		w    int
+		want string
+	}{
+		{"abc", 5, "abc  "},
+		{"abcde", 5, "ab.. "},
+		{"原神", 6, "原神  "},
+		{"星穹铁道", 8, "星穹..  "},
+		{"x", 1, " "},
+	}
+	for _, c := range cases {
+		if got := fit(c.in, c.w); got != c.want || width(got) != c.w {
+			t.Errorf("fit(%q, %d) = %q, want %q", c.in, c.w, got, c.want)
+		}
+	}
+	if got := clip(paint(cRed, "原神abc"), 5); got != cRed+"原神a"+cReset {
+		t.Errorf("clip = %q", got)
+	}
+}
+
+func TestFmtShort(t *testing.T) {
+	for n, want := range map[int64]string{0: "0B", 1000: "1000B", 1536: "1.50K", 500 << 10: "500K", 12 << 20: "12.0M", 7 << 30: "7.00G"} {
+		if got := fmtShort(n); got != want {
+			t.Errorf("fmtShort(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestPlace(t *testing.T) {
+	for in, want := range map[string]string{
+		"辽宁省本溪市 联通":     "辽宁本溪 联通",
+		"广西壮族自治区北海市 电信": "广西北海 电信",
+		"北京市 联通":        "北京 联通",
+		"澳大利亚":          "澳大利亚",
+	} {
+		if got := shortPlace(in); got != want {
+			t.Errorf("shortPlace(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]string{
+		"CNC Group CHINA169 Liaoning Province Network": "联通",
+		"Chinanet": "电信",
+		"China Mobile Communications Corporation": "移动",
+		"Cloudflare, Inc":                         "Cloudflare, Inc",
+	} {
+		if got := shortISP(in); got != want {
+			t.Errorf("shortISP(%q) = %q, want %q", in, got, want)
+		}
+	}
+	var g *geoCache
+	if g.get("127.0.0.1") != "本机" || g.get("192.168.1.1") != "局域网" || g.get("1.1.1.1") != "" {
+		t.Error("geo.get special addresses")
 	}
 }

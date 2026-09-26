@@ -101,7 +101,7 @@ func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group,
 	sort.Slice(keys, func(i, j int) bool { return verLess(keys[j], keys[i]) }) // 新版本在前
 
 	g := &group{name: gameNames[id]}
-	b := newSourceBuilder("", "", 0)
+	b := newSourceBuilder("整包", "", "", 0)
 	seen := map[string]bool{}
 	add := func(u string, size int64) {
 		if !seen[u] {
@@ -272,7 +272,7 @@ func loadManifest(ctx context.Context, c *http.Client, m sophonManifest) (*sourc
 			defer zr.Close()
 			r = zr
 		}
-		b := newSourceBuilder(m.ChunkDL.URLPrefix+"/", m.ChunkDL.URLSuffix, hint)
+		b := newSourceBuilder(fieldLabel(m.Field), m.ChunkDL.URLPrefix+"/", m.ChunkDL.URLSuffix, hint)
 		if err := parseManifest(r, b.add); err != nil {
 			return err
 		}
@@ -280,6 +280,20 @@ func loadManifest(ctx context.Context, c *http.Client, m sophonManifest) (*sourc
 		return nil
 	})
 	return src, err
+}
+
+// fieldLabel 把清单的 matching_field 转成界面上显示的类型。
+func fieldLabel(f string) string {
+	switch f {
+	case "game":
+		return "本体"
+	case "asb":
+		return "资源包"
+	}
+	if len(f) == 5 && f[2] == '-' { // zh-cn、en-us 等语音包
+		return "语音 " + f
+	}
+	return f
 }
 
 var errBadManifest = errors.New("清单格式错误")
