@@ -209,7 +209,7 @@ func (e statusError) Error() string { return fmt.Sprintf("HTTP %d", int(e)) }
 
 var errStalled = errors.New("30 秒未收到数据")
 
-const stallTimeout = 30 * time.Second
+var stallTimeout = 30 * time.Second // 测试里会调小
 
 type downloader struct {
 	pool      *pool

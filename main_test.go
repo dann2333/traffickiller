@@ -2,8 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestParseRate(t *testing.T) {
@@ -246,5 +251,40 @@ func TestPlace(t *testing.T) {
 	var g *geoCache
 	if g.get("127.0.0.1") != "本机" || g.get("192.168.1.1") != "局域网" || g.get("1.1.1.1") != "" {
 		t.Error("geo.get special addresses")
+	}
+}
+
+// 第一次请求发一半数据后卡住，应在 stallTimeout 后放弃并重试成功。
+func TestManifestStallRetry(t *testing.T) {
+	defer func(d time.Duration) { stallTimeout = d }(stallTimeout)
+	stallTimeout = 300 * time.Millisecond
+	var m []byte
+	for _, n := range []string{"c1", "c2", "c3"} {
+		m = append(m, pbStr(1, append(pbStr(1, []byte("f")), pbStr(2, append(pbStr(1, []byte(n)), pbVarint(4, 10)...))...))...)
+	}
+	var calls atomic.Int32
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Write(m[:len(m)/2])
+			w.(http.Flusher).Flush()
+			<-done
+			return
+		}
+		w.Write(m)
+	}))
+	defer srv.Close()
+	defer close(done) // 先放开卡住的请求，srv.Close 才能返回
+
+	var sm sophonManifest
+	sm.Manifest.ID = "x"
+	sm.ManifestDL.URLPrefix = srv.URL
+	sm.ChunkDL.URLPrefix = "https://cdn"
+	src, err := loadManifest(context.Background(), srv.Client(), "test", sm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(src.items) != 3 || calls.Load() != 2 {
+		t.Fatalf("items = %d, calls = %d", len(src.items), calls.Load())
 	}
 }

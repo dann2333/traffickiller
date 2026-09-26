@@ -218,7 +218,7 @@ func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) e
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			src, err := loadManifest(ctx, c, m)
+			src, err := loadManifest(ctx, c, gameNames[id], m)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -244,7 +244,7 @@ func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) e
 	return nil
 }
 
-func loadManifest(ctx context.Context, c *http.Client, m sophonManifest) (*source, error) {
+func loadManifest(ctx context.Context, c *http.Client, game string, m sophonManifest) (*source, error) {
 	select {
 	case manifestSem <- struct{}{}:
 		defer func() { <-manifestSem }()
@@ -258,12 +258,17 @@ func loadManifest(ctx context.Context, c *http.Client, m sophonManifest) (*sourc
 	err := retry(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancel()
+		ctx, stall := context.WithCancelCause(ctx)
+		defer stall(nil)
 		resp, err := get(ctx, c, murl)
 		if err != nil {
 			return err
 		}
 		defer resp.Body.Close()
-		var r io.Reader = resp.Body
+		// 服务器偶尔连接不断却不再发数据，一段时间没有数据就放弃这次、重新下载
+		t := time.AfterFunc(stallTimeout, func() { stall(errStalled) })
+		defer t.Stop()
+		var r io.Reader = idleReader{resp.Body, t}
 		if m.ManifestDL.Compression == 1 {
 			zr, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
 			if err != nil {
@@ -274,12 +279,30 @@ func loadManifest(ctx context.Context, c *http.Client, m sophonManifest) (*sourc
 		}
 		b := newSourceBuilder(fieldLabel(m.Field), m.ChunkDL.URLPrefix+"/", m.ChunkDL.URLSuffix, hint)
 		if err := parseManifest(r, b.add); err != nil {
+			if context.Cause(ctx) == errStalled {
+				con.logf("%s: 清单 %s %v，重新下载", game, m.Field, errStalled)
+				return errStalled
+			}
 			return err
 		}
 		src = b.build()
 		return nil
 	})
 	return src, err
+}
+
+// idleReader 每读到数据就重置计时器，计时器到期说明连接卡住了。
+type idleReader struct {
+	r io.Reader
+	t *time.Timer
+}
+
+func (ir idleReader) Read(p []byte) (int, error) {
+	n, err := ir.r.Read(p)
+	if n > 0 {
+		ir.t.Reset(stallTimeout)
+	}
+	return n, err
 }
 
 // fieldLabel 把清单的 matching_field 转成界面上显示的类型。
