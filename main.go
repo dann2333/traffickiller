@@ -71,7 +71,7 @@ const usage = `traffickiller %s - 流量消耗器
   -6                   绑定网卡时优先使用 IPv6 地址
   -http                CDN 下载改用 HTTP 而非 HTTPS，省去 TLS 解密开销 (适合路由器等弱 CPU 设备)
   -plain               不用全屏界面，只输出单行状态 (输出不是终端时自动如此)
-  -nogeo               界面上不查询服务器 IP 属地 (默认通过百度 / ip-api.com 查询)
+  -nogeo               不显示服务器 IP 属地 (属地用内置的离线数据库查询，不联网)
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
   -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
                        默认使用几个米哈游启动器的 UA (HYPContainer/...)
@@ -285,8 +285,7 @@ func run() int {
 		}
 		var geo *geoCache
 		if !noGeo {
-			geo = newGeoCache(egs[0].client(2))
-			go geo.run(ctx)
+			geo = newGeoCache()
 		}
 		go newTUI(d, groups, conns, start, dur, info, geo).run(ctx, interval)
 	} else {

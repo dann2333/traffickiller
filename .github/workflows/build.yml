@@ -66,7 +66,24 @@ jobs:
           freebsd amd64 freebsd-amd64
           freebsd arm64 freebsd-arm64
           EOF
-          cd dist && sha256sum traffickiller-* > sha256sums.txt && ls -l
+
+      # 用 UPX 压缩可执行文件（约能减小一半体积）。UPX 不支持的平台
+      # (macOS、FreeBSD、riscv64、loong64、mips64、windows/arm64) 会跳过，保持原样。
+      - name: Compress with UPX
+        run: |
+          set -uo pipefail
+          sudo apt-get update && sudo apt-get install -y upx-ucl
+          upx --version | head -1
+          for f in dist/traffickiller-*; do
+            if upx -q --best --lzma "$f" >/dev/null 2>&1; then
+              echo "packed  $f"
+            else
+              echo "skipped $f (UPX 不支持该平台)"
+            fi
+          done
+
+      - name: Checksums
+        run: cd dist && sha256sum traffickiller-* > sha256sums.txt && ls -l
 
       - uses: actions/upload-artifact@v4
         with:

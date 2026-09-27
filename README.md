@@ -52,7 +52,7 @@ traffickiller [选项] [URL...]
   -6                   绑定网卡时优先使用 IPv6 地址
   -http                CDN 下载改用 HTTP 而非 HTTPS，省去 TLS 解密开销 (适合路由器等弱 CPU 设备)
   -plain               不用全屏界面，只输出单行状态 (输出不是终端时自动如此)
-  -nogeo               界面上不查询服务器 IP 属地
+  -nogeo               界面上不显示服务器 IP 属地
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
   -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
                        默认使用几个米哈游启动器的 UA (HYPContainer/...)
@@ -100,7 +100,7 @@ Ctrl+C 退出
 
 - 连接太多一屏放不下时只显示前面的，放大窗口可看到更多；出错的连接会显示错误和重试倒计时，最近几条日志显示在底部。
 - 服务器是本连接实际连上的 IP:端口。设置了 `HTTPS_PROXY` 等代理时显示的是代理地址，标题栏会注明。
-- IP 属地在后台查询并缓存，每个服务器 IP 只查一次：IPv4 用百度 IP 查询（省市 + 运营商），查不到或 IPv6 用 ip-api.com。只发送服务器 IP；不想查询可加 `-nogeo`。
+- IP 属地用内置的 [ip2region](https://github.com/lionsoul2014/ip2region) 离线数据库（IPv4 + IPv6 完整库，zstd 压缩后内嵌）在本地查询，**全程不联网**，也不会像在线查询那样受频率限制。国内到省市 + 运营商，国外到国家（部分到城市）。不想显示可加 `-nogeo`。
 - 输出重定向到文件、systemd/nohup 后台运行，或加 `-plain` 时，改为每隔一段时间输出一行：
 
 ```
@@ -183,4 +183,8 @@ OpenWrt / 其他：`nohup ./traffickiller -i pppoe-wan -c 16 -http -l 100M > /tm
 go build -trimpath -ldflags "-s -w" .
 ```
 
-推送到 `main` 后 GitHub Actions 会自动构建全部平台并更新 `latest` 发布；推送 `v*` 标签会生成对应版本的发布。
+推送到 `main` 后 GitHub Actions 会自动构建全部平台并更新 `latest` 发布；推送 `v*` 标签会生成对应版本的发布。发布的可执行文件会用 UPX 压缩（UPX 不支持的平台如 macOS、riscv64 保持原样）。
+
+## 数据来源与许可
+
+IP 属地数据来自 [ip2region](https://github.com/lionsoul2014/ip2region)（`ipdb/` 目录下 zstd 压缩内嵌），按 Apache-2.0 或 MIT 许可分发，许可全文见 [`ipdb/LICENSE.md`](ipdb/LICENSE.md)。更新数据库参见 [`ipdb/update.sh`](ipdb/update.sh)。

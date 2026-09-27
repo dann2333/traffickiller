@@ -229,31 +229,44 @@ func TestFmtShort(t *testing.T) {
 	}
 }
 
-func TestPlace(t *testing.T) {
+func TestGeo(t *testing.T) {
 	for in, want := range map[string]string{
-		"辽宁省本溪市 联通":     "辽宁本溪 联通",
-		"广西壮族自治区北海市 电信": "广西北海 电信",
-		"北京市 联通":        "北京 联通",
-		"上海市上海市 电信":     "上海 电信",
-		"澳大利亚":          "澳大利亚",
+		"中国|辽宁省|本溪市|联通|CN":                                              "辽宁本溪 联通",
+		"中国|广西|北海市|中国电信|CN":                                             "广西北海 电信",
+		"中国|上海市|上海市|电信|CN":                                              "上海 电信",
+		"中国|香港特别行政区|0|电讯盈科|CN":                                          "香港 电讯盈科",
+		"中国|0|0|0|CN":                                                   "中国",
+		"Japan|Tokyo|Tokyo|WIDE Project|JP":                             "日本 Tokyo WIDE Project",
+		"United States|California|Los Angeles|AT&T Enterprises, LLC|US": "美国 Los Angeles AT&T Enterprises",
+		"Australia|Queensland|0|0|AU":                                   "澳大利亚 Queensland",
+		"Atlantis|0|0|0|XX":                                             "Atlantis",
+		"Reserved|Reserved|Reserved|0|0":                                "保留地址",
+		"":                                                              "",
 	} {
-		if got := shortPlace(in); got != want {
-			t.Errorf("shortPlace(%q) = %q, want %q", in, got, want)
-		}
-	}
-	for in, want := range map[string]string{
-		"CNC Group CHINA169 Liaoning Province Network": "联通",
-		"Chinanet": "电信",
-		"China Mobile Communications Corporation": "移动",
-		"Cloudflare, Inc":                         "Cloudflare, Inc",
-	} {
-		if got := shortISP(in); got != want {
-			t.Errorf("shortISP(%q) = %q, want %q", in, got, want)
+		if got := formatRegion(in); got != want {
+			t.Errorf("formatRegion(%q) = %q, want %q", in, got, want)
 		}
 	}
 	var g *geoCache
-	if g.get("127.0.0.1") != "本机" || g.get("192.168.1.1") != "局域网" || g.get("1.1.1.1") != "" {
+	if g.get("127.0.0.1") != "本机" || g.get("192.168.1.1") != "局域网" || g.get("fe80::1%eth0") != "局域网" || g.get("1.1.1.1") != "" {
 		t.Error("geo.get special addresses")
+	}
+
+	// 内嵌的完整数据库
+	g = newGeoCache()
+	for ip, want := range map[string]string{
+		"1.0.1.1":     "福建福州 电信",
+		"2001:200::1": "日本 Tokyo WIDE Project",
+	} {
+		deadline := time.Now().Add(10 * time.Second)
+		got := g.get(ip)
+		for got == "" && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+			got = g.get(ip)
+		}
+		if got != want {
+			t.Errorf("geo.get(%q) = %q, want %q", ip, got, want)
+		}
 	}
 }
 
