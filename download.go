@@ -26,6 +26,7 @@ type source struct {
 	prefix, suffix string
 	names          string
 	items          []span
+	sizes          []int64 // 各文件大小，只有整包这类直链来源保存（用于分段下载）
 	bytes          int64
 }
 
@@ -47,8 +48,9 @@ func (s *source) name(sp span) string {
 
 // sourceBuilder 逐个追加文件来构建 source。
 type sourceBuilder struct {
-	src   source
-	names strings.Builder
+	src       source
+	names     strings.Builder
+	keepSizes bool
 }
 
 func newSourceBuilder(label, prefix, suffix string, sizeHint int) *sourceBuilder {
@@ -57,10 +59,19 @@ func newSourceBuilder(label, prefix, suffix string, sizeHint int) *sourceBuilder
 	return b
 }
 
+// withSizes 让来源记住每个文件的大小，大文件就能随机分段下载。
+func (b *sourceBuilder) withSizes() *sourceBuilder {
+	b.keepSizes = true
+	return b
+}
+
 func (b *sourceBuilder) add(name []byte, size int64) {
 	b.src.items = append(b.src.items, span{uint32(b.names.Len()), uint32(len(name))})
 	b.names.Write(name)
 	b.src.bytes += size
+	if b.keepSizes {
+		b.src.sizes = append(b.src.sizes, size)
+	}
 }
 
 func (b *sourceBuilder) build() *source {
@@ -73,8 +84,9 @@ type group struct {
 	name    string
 	desc    string
 	sources []*source
-	count   int // 文件总数
-	fails   int // 连续失效 (403/404/410) 次数
+	count   int     // 文件总数
+	fails   int     // 连续失效 (403/404/410) 次数
+	weight  float64 // 被选中的权重，见 newPool
 
 	got  atomic.Int64 // 已下载字节
 	done atomic.Int64 // 已下载完的文件数
@@ -95,23 +107,83 @@ func (g *group) bytes() (n int64) {
 	return n
 }
 
-// pool 随机分配资源：先随机选游戏，再随机选文件。失效的文件/来源会被剔除。
+// segSize 是大文件每次请求下载的长度。整包动辄几 GB，整个下完要几十分钟，
+// 连接会长时间停在同一个游戏上；随机取一段下载，各游戏才能均衡。
+const segSize = 32 << 20
+
+// task 是一次下载：一个文件，或大文件中的一段。
+type task struct {
+	g    *group
+	s    *source
+	sp   span
+	size int64 // 文件大小，未知为 0
+}
+
+// segment 为大文件随机选一段（按 1MB 对齐，便于 CDN 缓存），返回起点和长度；
+// 小文件或大小未知时返回 0, 0，表示下载整个文件。
+func (t task) segment() (off, n int64) {
+	if t.size <= segSize {
+		return 0, 0
+	}
+	return rand.Int64N((t.size-segSize)>>20+1) << 20, segSize
+}
+
+// pool 随机分配资源：先按权重选游戏，再随机选文件。失效的文件/来源会被剔除。
 type pool struct {
 	mu     sync.Mutex
 	groups []*group
 }
 
-func (p *pool) pick() (*group, *source, span, bool) {
+// newPool 按每次请求的平均字节数给游戏加权（权重与之成反比），
+// 这样分块很小的游戏和整包很大的游戏得到的流量大致相同。
+func newPool(groups []*group) *pool {
+	for _, g := range groups {
+		var sum int64
+		for _, s := range g.sources {
+			if s.sizes == nil {
+				sum += s.bytes
+				continue
+			}
+			for _, n := range s.sizes {
+				sum += min(n, segSize)
+			}
+		}
+		avg := float64(sum) / float64(max(g.count, 1))
+		if avg <= 0 {
+			avg = 1 << 20 // 大小未知（自定义 URL）
+		}
+		g.weight = 1 / avg
+	}
+	return &pool{groups: slices.Clone(groups)}
+}
+
+func (p *pool) pick() (task, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.groups) == 0 {
-		return nil, nil, span{}, false
+		return task{}, false
 	}
-	g := p.groups[rand.IntN(len(p.groups))]
+	var sum float64
+	for _, g := range p.groups {
+		sum += g.weight
+	}
+	g := p.groups[len(p.groups)-1]
+	r := rand.Float64() * sum
+	for _, x := range p.groups {
+		if r < x.weight {
+			g = x
+			break
+		}
+		r -= x.weight
+	}
 	i := rand.IntN(g.count)
 	for _, s := range g.sources {
 		if i < len(s.items) {
-			return g, s, s.items[i], true
+			t := task{g: g, s: s, sp: s.items[i]}
+			if s.sizes != nil {
+				t.size = s.sizes[i]
+			}
+			return t, true
 		}
 		i -= len(s.items)
 	}
@@ -119,17 +191,23 @@ func (p *pool) pick() (*group, *source, span, bool) {
 }
 
 // report 记录下载结果；gone 表示该文件已失效。返回整个来源是否被停用。
-func (p *pool) report(g *group, s *source, sp span, gone bool) bool {
+func (p *pool) report(t task, gone bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	g, s := t.g, t.s
 	if !gone {
 		g.fails = 0
 		return false
 	}
 	g.fails++
-	if i := slices.Index(s.items, sp); i >= 0 {
-		s.items[i] = s.items[len(s.items)-1]
-		s.items = s.items[:len(s.items)-1]
+	if i := slices.Index(s.items, t.sp); i >= 0 {
+		last := len(s.items) - 1
+		s.items[i] = s.items[last]
+		s.items = s.items[:last]
+		if s.sizes != nil {
+			s.sizes[i] = s.sizes[last]
+			s.sizes = s.sizes[:last]
+		}
 		g.count--
 		if len(s.items) == 0 {
 			g.sources = slices.DeleteFunc(g.sources, func(x *source) bool { return x == s })
@@ -270,26 +348,32 @@ func (d *downloader) worker(ctx context.Context, c *http.Client, st *conn) {
 	buf := make([]byte, 64<<10)
 	backoff := time.Second
 	for ctx.Err() == nil {
-		g, s, sp, ok := d.pool.pick()
+		t, ok := d.pool.pick()
 		if !ok {
 			d.stop(errNoSource)
 			return
 		}
-		u := s.url(sp)
+		g := t.g
+		u := t.s.url(t.sp)
 		if d.plainHTTP && strings.HasPrefix(u, "https://") {
 			u = "http://" + u[len("https://"):]
 		}
+		off, n := t.segment()
+		file := t.s.name(t.sp)
+		if n > 0 {
+			file += " @" + fmtShort(off)
+		}
 		st.cur.Store(0)
 		st.set(func(st *conn) {
-			st.state, st.g, st.kind, st.file, st.size, st.err = stRequest, g, s.label, s.name(sp), -1, ""
+			st.state, st.g, st.kind, st.file, st.size, st.err = stRequest, g, t.s.label, file, -1, ""
 		})
-		err := d.fetch(ctx, c, u, g, st, buf)
+		err := d.fetch(ctx, c, u, off, n, g, st, buf)
 		if ctx.Err() != nil {
 			return
 		}
 		var se statusError
 		gone := errors.As(err, &se) && (se == 403 || se == 404 || se == 410)
-		if d.pool.report(g, s, sp, gone) {
+		if d.pool.report(t, gone) {
 			con.logf("%s: 资源连续失效 (%v)，已停用该来源", g.name, err)
 		}
 		if err == nil {
@@ -310,8 +394,8 @@ func (d *downloader) worker(ctx context.Context, c *http.Client, st *conn) {
 	}
 }
 
-// fetch 下载一个文件，数据读进缓冲区后直接丢弃。
-func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, g *group, st *conn, buf []byte) error {
+// fetch 下载一个文件（n > 0 时只下载从 off 开始的 n 字节），数据读进缓冲区后直接丢弃。
+func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, off, n int64, g *group, st *conn, buf []byte) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, st.trace), http.MethodGet, u, nil)
@@ -319,6 +403,9 @@ func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, g *gro
 		return err
 	}
 	req.Header.Set("User-Agent", st.ua)
+	if n > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+n-1))
+	}
 	resp, err := c.Do(req)
 	if err != nil {
 		return err
@@ -327,12 +414,17 @@ func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, g *gro
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return statusError(resp.StatusCode)
 	}
-	st.set(func(st *conn) { st.state, st.size = stDownload, resp.ContentLength })
+	size := resp.ContentLength
+	if n > 0 && resp.StatusCode == http.StatusOK {
+		size = n // 服务器不支持分段、返回了整个文件：读够 n 字节就断开
+	}
+	st.set(func(st *conn) { st.state, st.size = stDownload, size })
 
 	d.active.Add(1)
 	defer d.active.Add(-1)
 	watchdog := time.AfterFunc(stallTimeout, func() { cancel(errStalled) })
 	defer watchdog.Stop()
+	var got int64
 	for {
 		// 先预留额度再读，读完退还多余部分，总速率不会超出上限。
 		if d.lim != nil {
@@ -342,15 +434,18 @@ func (d *downloader) fetch(ctx context.Context, c *http.Client, u string, g *gro
 			}
 			watchdog.Reset(stallTimeout)
 		}
-		n, err := resp.Body.Read(buf)
-		d.lim.refund(len(buf) - n)
-		if n > 0 {
+		k, err := resp.Body.Read(buf)
+		d.lim.refund(len(buf) - k)
+		if k > 0 {
 			watchdog.Reset(stallTimeout)
-			st.n.Add(int64(n))
-			st.cur.Add(int64(n))
-			g.got.Add(int64(n))
-			if v := d.total.Add(int64(n)); d.maxTotal > 0 && v >= d.maxTotal {
+			st.n.Add(int64(k))
+			st.cur.Add(int64(k))
+			g.got.Add(int64(k))
+			if v := d.total.Add(int64(k)); d.maxTotal > 0 && v >= d.maxTotal {
 				d.stop(errTotalReached)
+				return nil
+			}
+			if got += int64(k); n > 0 && got >= n {
 				return nil
 			}
 		}

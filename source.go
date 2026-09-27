@@ -101,7 +101,7 @@ func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group,
 	sort.Slice(keys, func(i, j int) bool { return verLess(keys[j], keys[i]) }) // 新版本在前
 
 	g := &group{name: gameNames[id]}
-	b := newSourceBuilder("整包", "", "", 0)
+	b := newSourceBuilder("整包", "", "", 0).withSizes()
 	seen := map[string]bool{}
 	add := func(u string, size int64) {
 		if !seen[u] {

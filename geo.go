@@ -111,10 +111,22 @@ func (g *geoCache) query(ctx context.Context, ip string) string {
 	return strings.TrimSpace(loc + " " + shortISP(r.ISP))
 }
 
-// shortPlace 去掉省、市、自治区等后缀，如 "广西壮族自治区北海市" -> "广西北海"。
-var shortPlace = strings.NewReplacer(
+var placeSuffix = strings.NewReplacer(
 	"壮族自治区", "", "回族自治区", "", "维吾尔自治区", "", "自治区", "", "特别行政区", "", "省", "", "市", "",
-).Replace
+)
+
+// shortPlace 去掉省、市、自治区等后缀并合并重复的地名，
+// 如 "广西壮族自治区北海市 电信" -> "广西北海 电信"，"上海市上海市 电信" -> "上海 电信"。
+func shortPlace(s string) string {
+	place, isp, ok := strings.Cut(placeSuffix.Replace(s), " ")
+	if h := len(place) / 2; len(place)%2 == 0 && place[:h] == place[h:] {
+		place = place[:h]
+	}
+	if ok {
+		return place + " " + isp
+	}
+	return place
+}
 
 func (g *geoCache) getJSON(ctx context.Context, u string, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

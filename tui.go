@@ -231,7 +231,7 @@ func (u *tui) render(now time.Time) []string {
 	}
 	lines := []string{
 		head + "  " + paint(cGray, u.info),
-		fmt.Sprintf("速率 %s  平均 %s  累计 %s  完成文件 %d  连接 %d/%d",
+		fmt.Sprintf("速率 %s  平均 %s  累计 %s  完成 %d 次  连接 %d/%d",
 			paint(cBold+cGreen, fmtRate(u.rate)+" ("+fmtBytes(u.rate)+"/s)"),
 			fmtRate(avg), paint(cBold, fmtBytes(float64(total))), d.done.Load(), d.active.Load(), len(u.conns)),
 	}
@@ -259,7 +259,7 @@ func (u *tui) render(now time.Time) []string {
 	}
 
 	// 各游戏
-	lines = append(lines, "", paint(cBold, fit("游戏", 10)+fit("速率", 12)+fit("占比", 18)+fit("累计", 12)+fit("连接", 6)+fit("完成文件", 10)+"资源"))
+	lines = append(lines, "", paint(cBold, fit("游戏", 10)+fit("速率", 12)+fit("占比", 18)+fit("累计", 12)+fit("连接", 6)+fit("完成次数", 10)+"资源"))
 	for i, g := range u.groups {
 		name := paint(cCyan, fit(g.name, 10))
 		if g.off.Load() {

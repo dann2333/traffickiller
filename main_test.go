@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -130,29 +132,29 @@ func TestPoolDropsDeadSource(t *testing.T) {
 		}
 		g.add(b.build())
 	}
-	p := &pool{groups: []*group{g}}
+	p := newPool([]*group{g})
 	for i := range 9 {
-		_, s, sp, _ := p.pick()
-		if p.report(g, s, sp, true) {
+		tk, _ := p.pick()
+		if p.report(tk, true) {
 			t.Fatalf("group dropped too early at %d", i)
 		}
 	}
 	if g.count != 11 {
 		t.Fatalf("count = %d, want 11", g.count)
 	}
-	_, s, sp, _ := p.pick()
-	p.report(g, s, sp, false) // 成功一次会清零连续失败计数
+	tk, _ := p.pick()
+	p.report(tk, false) // 成功一次会清零连续失败计数
 	for range 9 {
-		_, s, sp, _ := p.pick()
-		if p.report(g, s, sp, true) {
+		tk, _ := p.pick()
+		if p.report(tk, true) {
 			t.Fatal("group dropped although failures were not consecutive")
 		}
 	}
-	_, s, sp, _ = p.pick()
-	if !p.report(g, s, sp, true) {
+	tk, _ = p.pick()
+	if !p.report(tk, true) {
 		t.Fatal("group should be dropped after 10 consecutive failures")
 	}
-	if _, _, _, ok := p.pick(); ok {
+	if _, ok := p.pick(); ok {
 		t.Fatal("pool should be empty")
 	}
 }
@@ -166,14 +168,14 @@ func TestPoolEmptiesSource(t *testing.T) {
 		}
 		g.add(b.build())
 	}
-	p := &pool{groups: []*group{g}}
+	p := newPool([]*group{g})
 	small := g.sources[0]
-	p.report(g, small, small.items[0], true)
+	p.report(task{g: g, s: small, sp: small.items[0]}, true)
 	if len(g.sources) != 1 || g.count != 3 {
 		t.Fatalf("sources = %d, count = %d", len(g.sources), g.count)
 	}
 	for range 100 {
-		if _, s, _, _ := p.pick(); s == small {
+		if tk, _ := p.pick(); tk.s == small {
 			t.Fatal("picked from emptied source")
 		}
 	}
@@ -232,6 +234,7 @@ func TestPlace(t *testing.T) {
 		"辽宁省本溪市 联通":     "辽宁本溪 联通",
 		"广西壮族自治区北海市 电信": "广西北海 电信",
 		"北京市 联通":        "北京 联通",
+		"上海市上海市 电信":     "上海 电信",
 		"澳大利亚":          "澳大利亚",
 	} {
 		if got := shortPlace(in); got != want {
@@ -286,5 +289,125 @@ func TestManifestStallRetry(t *testing.T) {
 	}
 	if len(src.items) != 3 || calls.Load() != 2 {
 		t.Fatalf("items = %d, calls = %d", len(src.items), calls.Load())
+	}
+}
+
+// 分块小的游戏和整包大的游戏，按字节算得到的流量应大致相同。
+func TestPoolBalancesBytes(t *testing.T) {
+	chunks := &group{name: "chunks"}
+	b := newSourceBuilder("", "https://a/", "", 1000)
+	for i := range 1000 {
+		b.add([]byte(fmt.Sprint(i)), 1<<20)
+	}
+	chunks.add(b.build())
+	big := &group{name: "big"}
+	b = newSourceBuilder("", "", "", 4).withSizes()
+	for i := range 4 {
+		b.add([]byte(fmt.Sprint("https://b/", i)), 8<<30)
+	}
+	big.add(b.build())
+	p := newPool([]*group{chunks, big})
+
+	got := map[*group]int64{}
+	for range 200000 {
+		tk, _ := p.pick()
+		n := tk.size
+		if _, seg := tk.segment(); seg > 0 {
+			n = seg
+		} else if n == 0 {
+			n = 1 << 20
+		}
+		got[tk.g] += n
+	}
+	if r := float64(got[big]) / float64(got[chunks]); r < 0.85 || r > 1.15 {
+		t.Fatalf("bytes big/chunks = %.2f, want ~1", r)
+	}
+}
+
+func TestSegment(t *testing.T) {
+	for range 1000 {
+		tk := task{size: 8<<30 + 12345}
+		off, n := tk.segment()
+		if n != segSize || off%(1<<20) != 0 || off < 0 || off+n > tk.size {
+			t.Fatalf("segment = %d+%d of %d", off, n, tk.size)
+		}
+	}
+	for _, size := range []int64{0, 1 << 20, segSize} {
+		if off, n := (task{size: size}).segment(); off != 0 || n != 0 {
+			t.Fatalf("size %d: segment = %d+%d, want whole file", size, off, n)
+		}
+	}
+}
+
+func TestReportKeepsSizesAligned(t *testing.T) {
+	g := &group{name: "x"}
+	b := newSourceBuilder("", "", "", 3).withSizes()
+	for i, n := range []int64{100, 200, 300} {
+		b.add([]byte{byte('a' + i)}, n)
+	}
+	g.add(b.build())
+	p := newPool([]*group{g})
+	s := g.sources[0]
+	p.report(task{g: g, s: s, sp: s.items[0]}, true)
+	for i, sp := range s.items {
+		if want := int64(s.names[sp.off]-'a'+1) * 100; s.sizes[i] != want {
+			t.Fatalf("item %c size = %d, want %d", s.names[sp.off], s.sizes[i], want)
+		}
+	}
+}
+
+// zeros 是不占内存的定长全零内容，供 http.ServeContent 分段读取。
+type zeros struct{ pos, size int64 }
+
+func (z *zeros) Read(p []byte) (int, error) {
+	if z.pos >= z.size {
+		return 0, io.EOF
+	}
+	n := int(min(int64(len(p)), z.size-z.pos))
+	clear(p[:n])
+	z.pos += int64(n)
+	return n, nil
+}
+
+func (z *zeros) Seek(off int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		z.pos = off
+	case io.SeekCurrent:
+		z.pos += off
+	case io.SeekEnd:
+		z.pos = z.size + off
+	}
+	return z.pos, nil
+}
+
+func TestFetchSegment(t *testing.T) {
+	const size = 100 << 20
+	for _, ranged := range []bool{true, false} {
+		var rng string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rng = r.Header.Get("Range")
+			if !ranged {
+				r.Header.Del("Range") // 模拟不支持分段的服务器，返回整个文件
+			}
+			http.ServeContent(w, r, "f", time.Time{}, &zeros{size: size})
+		}))
+		d := &downloader{stop: func(error) {}}
+		g := &group{}
+		st := newConn("ua")
+		off, n := int64(5<<20), int64(segSize)
+		if err := d.fetch(context.Background(), srv.Client(), srv.URL, off, n, g, st, make([]byte, 64<<10)); err != nil {
+			t.Fatal(err)
+		}
+		srv.Close()
+		if want := fmt.Sprintf("bytes=%d-%d", off, off+n-1); rng != want {
+			t.Errorf("Range = %q, want %q", rng, want)
+		}
+		if got := d.total.Load(); got < n || got > n+64<<10 {
+			t.Errorf("ranged=%v: downloaded %d bytes, want %d", ranged, got, n)
+		}
+		if st.size != n {
+			t.Errorf("ranged=%v: size = %d, want %d", ranged, st.size, n)
+		}
 	}
 }

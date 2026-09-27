@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -59,7 +58,7 @@ const usage = `traffickiller %s - 流量消耗器
 选项:
   -i, -iface <网卡>    出口网卡名或本机 IP，多个用逗号分隔 (如 eth0 / pppoe-wan,pppoe-wan2)
                        默认走系统路由；多网卡时并发连接轮流分配到各网卡
-  -c, -conc <数量>     并发连接数 (默认 32；跑 5Gbps 以上建议 64 或更高)
+  -c, -conc <数量>     并发连接数 (默认 32；跑数 Gbps 建议 128 左右)
   -l, -limit <带宽>    总带宽上限，默认不限。100M / 100Mbps = 100 兆比特每秒 (宽带口径)，
                        12MB / 12MB/s = 12 兆字节每秒
   -t, -total <流量>    累计下载达到该流量后退出，如 500G、1.5T、800MB (1024 进制)
@@ -248,7 +247,7 @@ func run() int {
 	proxy := proxyFor(groups, plainHTTP) // 须在下载开始、资源列表被改动之前取
 
 	d := &downloader{
-		pool:      &pool{groups: slices.Clone(groups)}, // 界面持有原列表，停用的游戏仍会显示
+		pool:      newPool(groups), // 内部复制一份列表；界面持有原列表，停用的游戏仍会显示
 		lim:       newLimiter(rate),
 		plainHTTP: plainHTTP,
 		maxTotal:  maxTotal,
