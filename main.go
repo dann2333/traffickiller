@@ -58,7 +58,8 @@ const usage = `traffickiller %s - 流量消耗器
 选项:
   -i, -iface <网卡>    出口网卡名或本机 IP，多个用逗号分隔 (如 eth0 / pppoe-wan,pppoe-wan2)
                        默认走系统路由；多网卡时并发连接轮流分配到各网卡
-  -c, -conc <数量>     并发连接数 (默认 32；跑数 Gbps 建议 128 左右)
+  -c, -conc <数量>     并发连接数 (默认 128，约可跑 4Gbps；更高带宽可加到 256；
+                       路由器等弱设备建议 16～32)
   -l, -limit <带宽>    总带宽上限，默认不限。100M / 100Mbps = 100 兆比特每秒 (宽带口径)，
                        12MB / 12MB/s = 12 兆字节每秒
   -t, -total <流量>    累计下载达到该流量后退出，如 500G、1.5T、800MB (1024 进制)
@@ -78,7 +79,7 @@ const usage = `traffickiller %s - 流量消耗器
   -v, -version         显示版本
 
 示例:
-  traffickiller                              # 不限速，32 并发，一直跑
+  traffickiller                              # 不限速，128 并发，一直跑
   traffickiller -i eth1 -c 16 -l 200M        # 从 eth1 下载，16 并发，限速 200Mbps
   traffickiller -l 50M -t 300G               # 限速 50Mbps，跑满 300GB 后退出
   traffickiller -i pppoe-wan -d 6h -g ys,zzz # 只下载原神和绝区零，跑 6 小时
@@ -100,7 +101,7 @@ func run() int {
 		fs.StringVar(&iface, n, "", "")
 	}
 	for _, n := range []string{"c", "conc"} {
-		fs.IntVar(&conc, n, 32, "")
+		fs.IntVar(&conc, n, 128, "")
 	}
 	for _, n := range []string{"l", "limit"} {
 		fs.StringVar(&limitStr, n, "0", "")

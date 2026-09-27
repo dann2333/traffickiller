@@ -5,7 +5,7 @@
 - 可指定出口网卡（支持多网卡 / 多拨）
 - 可控并发数、总带宽上限、总流量、运行时长
 - 四个游戏的流量大致均衡；大文件按 32MB 随机分段下载
-- 单文件静态二进制，无运行依赖；实测 128 并发约 4Gbps，CPU 占用不到 1 核、内存约 60MB
+- 单文件静态二进制，无运行依赖；默认 128 并发，实测约 4Gbps，CPU 占用不到 1 核、内存约 70MB
 - 全屏实时界面：总速率、各游戏速率，每个连接正在下载的文件、进度、速率、服务器 IP:端口和 IP 属地，见 [实时界面](#实时界面)
 - 默认使用多个米哈游启动器 (HoYoPlay) 的真实 UA，每个连接随机分配一个，见 [User-Agent](#user-agent)
 - 资源列表来自 [hoyo-files.amarea.cn](https://hoyo-files.amarea.cn/)，失效链接自动剔除
@@ -40,7 +40,8 @@ traffickiller [选项] [URL...]
 
   -i, -iface <网卡>    出口网卡名或本机 IP，多个用逗号分隔 (如 eth0 / pppoe-wan,pppoe-wan2)
                        默认走系统路由；多网卡时并发连接轮流分配到各网卡
-  -c, -conc <数量>     并发连接数 (默认 32；跑数 Gbps 建议 128 左右)
+  -c, -conc <数量>     并发连接数 (默认 128，约可跑 4Gbps；更高带宽可加到 256；
+                       路由器等弱设备建议 16～32)
   -l, -limit <带宽>    总带宽上限，默认不限。100M / 100Mbps = 100 兆比特每秒 (宽带口径)，
                        12MB / 12MB/s = 12 兆字节每秒
   -t, -total <流量>    累计下载达到该流量后退出，如 500G、1.5T、800MB (1024 进制)
@@ -62,8 +63,8 @@ traffickiller [选项] [URL...]
 示例：
 
 ```sh
-traffickiller                              # 不限速，32 并发，一直跑，Ctrl+C 退出
-traffickiller -c 128                       # 目标数 Gbps：加大并发
+traffickiller                              # 不限速，128 并发，一直跑，Ctrl+C 退出
+traffickiller -c 256                       # 带宽更高：加大并发
 traffickiller -i eth1 -c 16 -l 200M        # 从 eth1 下载，16 并发，限速 200Mbps
 traffickiller -l 50M -t 300G               # 限速 50Mbps，跑满 300GB 后退出
 traffickiller -i pppoe-wan -d 6h -g ys,zzz # 只下载原神和绝区零，跑 6 小时
@@ -103,7 +104,7 @@ Ctrl+C 退出
 - 输出重定向到文件、systemd/nohup 后台运行，或加 `-plain` 时，改为每隔一段时间输出一行：
 
 ```
-[00:05:12] 速率 99.9 Mbps (11.91 MB/s) | 平均 99.7 Mbps | 累计 3.62 GB / 300.00 GB (1.2%) | 连接 32/32
+[00:05:12] 速率 99.9 Mbps (11.91 MB/s) | 平均 99.7 Mbps | 累计 3.62 GB / 300.00 GB (1.2%) | 连接 128/128
 ```
 
 ## 工作原理
@@ -141,7 +142,9 @@ Ctrl+C 退出
 
 ## 跑满高带宽（数 Gbps）
 
-- 原神/星铁/崩坏3 的分块平均约 1MB，每个请求都有一次往返等待，连接数不够就跑不满：数 Gbps 建议 `-c 128` 左右，观察速率不再上升即可（实测 64 并发约 1.8Gbps，128 并发约 4Gbps）。
+- 原神/星铁/崩坏3 的分块平均约 1MB，每个请求都有一次往返等待，连接数不够就跑不满。实测：64 并发约 1.8Gbps，128 并发（默认）约 4Gbps、内存约 70MB，256 并发约 6Gbps、内存约 115MB。带宽更高就继续加 `-c`，观察速率不再上升即可。
+- 每个并发约占 3～4 个文件描述符（与各游戏 CDN 分别保持连接），`-c` 很大时注意 `ulimit -n`。
+- 路由器、小主机等弱设备用 `-c 16`～`-c 32`，可省内存和 CPU。
 - 不在乎游戏是否均衡、只求单连接效率时，可以用 `-g zzz` 只下载绝区零整包（每次请求 32MB，往返等待占比小）。
 - CPU 吃紧（路由器、小主机）时加 `-http`，省掉 TLS 解密。
 - 多线路时 `-i wan1,wan2,...` 把连接分摊到各线路。
@@ -170,7 +173,7 @@ systemctl enable --now traffickiller
 journalctl -u traffickiller -f
 ```
 
-OpenWrt / 其他：`nohup ./traffickiller -i pppoe-wan -l 100M > /tmp/tk.log 2>&1 &`
+OpenWrt / 其他：`nohup ./traffickiller -i pppoe-wan -c 16 -http -l 100M > /tmp/tk.log 2>&1 &`
 
 定时任务示例（每天凌晨 1 点跑 5 小时）：`0 1 * * * /usr/local/bin/traffickiller -l 200M -d 5h`
 
