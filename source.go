@@ -119,7 +119,7 @@ func loadGame(ctx context.Context, c doer, id string, all bool) (*group, error) 
 			collectURLs(vers[k], add)
 		}
 		g.add(b.build())
-		g.desc = fmt.Sprintf("全部版本 整包 %d 个", g.count)
+		g.setDesc(fmt.Sprintf("全部版本 整包 %d 个", g.count))
 		return g, nil
 	}
 
@@ -128,7 +128,7 @@ func loadGame(ctx context.Context, c doer, id string, all bool) (*group, error) 
 		collectURLs(vers[k], add)
 		if len(seen) > 0 {
 			g.add(b.build())
-			g.desc = fmt.Sprintf("%s 整包 %d 个", k, g.count)
+			g.setDesc(fmt.Sprintf("%s 整包 %d 个", k, g.count))
 			return g, nil
 		}
 		if e, _ := vers[k].(map[string]any); e != nil {
@@ -244,7 +244,7 @@ func loadSophon(ctx context.Context, c doer, id, tag string, g *group) error {
 	if firstErr != nil && ctx.Err() == nil {
 		con.logf("%s: 部分清单读取失败，已跳过: %v", g.name, firstErr)
 	}
-	g.desc = fmt.Sprintf("%s 分块 %d 个 (%d 个清单)", tag, g.count, len(g.sources))
+	g.setDesc(fmt.Sprintf("%s 分块 %d 个 (%d 个清单)", tag, g.count, len(g.sources)))
 	return nil
 }
 

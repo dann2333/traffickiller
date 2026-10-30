@@ -275,7 +275,7 @@ func (u *tui) render(now time.Time) []string {
 			fit(fmtBytes(float64(g.got.Load())), 12)+
 			fit(fmt.Sprint(busy[g]), 6)+
 			fit(fmt.Sprint(g.done.Load()), 10)+
-			paint(cGray, g.desc))
+			paint(cGray, g.getDesc()))
 	}
 
 	// 日志和连接列表按剩余高度分配，高度不够时先不显示日志

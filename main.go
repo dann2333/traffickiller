@@ -64,6 +64,8 @@ const usage = `traffickiller %s - 流量消耗器
                        12MB / 12MB/s = 12 兆字节每秒
   -t, -total <流量>    累计下载达到该流量后退出，如 500G、1.5T、800MB (1024 进制)
   -d, -duration <时长> 运行多久后退出，如 30m、2h、1h30m
+  -refresh <时长>      隔多久重新拉取资源列表，默认 1h。游戏更新后不用重启；0 表示不刷新
+                       (自定义 URL 不刷新)
   -g, -games <游戏>    资源来源，逗号分隔: hk4e(原神) hkrpg(星铁) nap(绝区零) bh3(崩坏3)
                        (默认全部)
   -all                 使用全部历史版本的整包，而不只是最新版本
@@ -92,7 +94,7 @@ func run() int {
 		iface, limitStr, totalStr, games, urlFile string
 		uas                                       listFlag
 		conc                                      int
-		dur, interval                             time.Duration
+		dur, interval, refreshEvery               time.Duration
 		all, prefer6, plainHTTP, list, showVer    bool
 		plain, noGeo                              bool
 	)
@@ -128,6 +130,7 @@ func run() int {
 	fs.BoolVar(&plain, "plain", false, "")
 	fs.BoolVar(&noGeo, "nogeo", false, "")
 	fs.DurationVar(&interval, "interval", 0, "")
+	fs.DurationVar(&refreshEvery, "refresh", time.Hour, "")
 	fs.Var(&uas, "ua", "")
 	fs.Usage = func() { fmt.Fprintf(os.Stderr, usage, version) }
 	flag.Parse()
@@ -178,6 +181,7 @@ func run() int {
 
 	// 资源列表
 	var groups []*group
+	var catalog doer
 	urls := flag.Args()
 	if urlFile != "" {
 		fromFile, err := loadURLFile(urlFile)
@@ -187,7 +191,8 @@ func run() int {
 		urls = append(urls, fromFile...)
 	}
 	if len(urls) > 0 {
-		g := &group{name: "自定义", desc: fmt.Sprintf("%d 个 URL", len(urls))}
+		g := &group{name: "自定义"}
+		g.setDesc(fmt.Sprintf("%d 个 URL", len(urls)))
 		b := newSourceBuilder("URL", "", "", len(urls))
 		for _, u := range urls {
 			b.add([]byte(u), 0)
@@ -200,6 +205,7 @@ func run() int {
 		if err != nil {
 			return fail("创建客户端失败: %v", err)
 		}
+		catalog = cli
 		groups = loadGames(ctx, cli, gameList, all)
 	}
 	if ctx.Err() != nil {
@@ -244,9 +250,9 @@ func run() int {
 		version, strings.Join(labels, ", "), conc, limitDesc, totalDesc, durDesc, len(userAgents))
 	for _, g := range groups {
 		if sz := g.bytes(); sz > 0 {
-			con.logf("  %s: %s, 共 %s", g.name, g.desc, fmtBytes(float64(sz)))
+			con.logf("  %s: %s, 共 %s", g.name, g.getDesc(), fmtBytes(float64(sz)))
 		} else {
-			con.logf("  %s: %s", g.name, g.desc)
+			con.logf("  %s: %s", g.name, g.getDesc())
 		}
 	}
 
@@ -258,6 +264,10 @@ func run() int {
 		plainHTTP: plainHTTP,
 		maxTotal:  maxTotal,
 		stop:      stop,
+	}
+	if refreshEvery > 0 && catalog != nil {
+		con.logf("资源列表每 %s 自动刷新", refreshEvery)
+		go refreshCatalog(ctx, catalog, gameList, all, d.pool, refreshEvery)
 	}
 	if dur > 0 {
 		time.AfterFunc(dur, func() { stop(errDuration) })
@@ -315,6 +325,39 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// refreshCatalog 隔一段时间重新拉资源列表。某个游戏这次没拉到就保留旧清单。
+func refreshCatalog(ctx context.Context, c doer, games []string, all bool, p *pool, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		con.logf("正在刷新资源列表...")
+		fresh := loadGames(ctx, c, games, all)
+		if ctx.Err() != nil {
+			return
+		}
+		var notes []string
+		for _, g := range fresh {
+			if p.adopt(g) {
+				notes = append(notes, g.name+" "+g.getDesc())
+			}
+		}
+		if len(notes) == 0 {
+			con.logf("资源列表无变化")
+		} else {
+			con.logf("资源已更新: %s", strings.Join(notes, "；"))
+		}
+		debug.FreeOSMemory()
+	}
 }
 
 // proxyFor 返回下载会经过的代理（来自 HTTPS_PROXY 等环境变量），没有则为空。

@@ -71,7 +71,7 @@ func (b *sourceBuilder) build() *source {
 // group 是一个游戏（或自定义 URL 列表）的全部资源。
 type group struct {
 	name    string
-	desc    string
+	desc    atomic.Value // string，界面上的说明；刷新时会换
 	sources []*source
 	count   int // 文件总数
 	fails   int // 连续失效 (403/404/410) 次数
@@ -86,6 +86,13 @@ type group struct {
 // 和启动器按 chunk_concurrent_tasks 并行下载完整分块一样。
 type seqCur struct {
 	si, ii int
+}
+
+func (g *group) setDesc(s string) { g.desc.Store(s) }
+
+func (g *group) getDesc() string {
+	v, _ := g.desc.Load().(string)
+	return v
 }
 
 func (g *group) add(s *source) {
@@ -113,12 +120,53 @@ type task struct {
 // 走完一遍后从头再来（持续消耗流量）。失效的文件会被剔除，游标跟着修正。
 type pool struct {
 	mu     sync.Mutex
-	groups []*group
+	groups []*group // 当前还能领任务的
+	stable []*group // 启动时的游戏对象，刷新时按名字找回，界面和连接都拿着这些指针
 	retry  []task
 }
 
 func newPool(groups []*group) *pool {
-	return &pool{groups: slices.Clone(groups)}
+	return &pool{groups: slices.Clone(groups), stable: slices.Clone(groups)}
+}
+
+// adopt 用新拉到的清单换掉同名游戏的文件。游戏对象不变，所以界面和已绑定的连接不用改。
+// 清单没有变化时不动游标，返回 false。已经停用的游戏在清单更新后会重新启用。
+func (p *pool) adopt(fresh *group) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var g *group
+	for _, x := range p.stable {
+		if x.name == fresh.name {
+			g = x
+			break
+		}
+	}
+	if g == nil || sameList(g, fresh) {
+		return false
+	}
+	g.sources = fresh.sources
+	g.count = fresh.count
+	g.seq = seqCur{}
+	g.fails = 0
+	g.setDesc(fresh.getDesc())
+	g.off.Store(false)
+	if slices.Index(p.groups, g) < 0 {
+		p.groups = append(p.groups, g)
+	}
+	return true
+}
+
+func sameList(a, b *group) bool {
+	if a.getDesc() != b.getDesc() || a.count != b.count || len(a.sources) != len(b.sources) {
+		return false
+	}
+	for i := range a.sources {
+		as, bs := a.sources[i], b.sources[i]
+		if as.label != bs.label || as.prefix != bs.prefix || as.suffix != bs.suffix || as.names != bs.names {
+			return false
+		}
+	}
+	return true
 }
 
 // pick 领取下一次下载。prefer 非空时优先领这个游戏的下一段（连接和游戏绑定，
@@ -176,6 +224,9 @@ func (p *pool) alive(t task) bool {
 	if t.g == nil || t.s == nil || t.g.off.Load() || slices.Index(p.groups, t.g) < 0 {
 		return false
 	}
+	if slices.Index(t.g.sources, t.s) < 0 {
+		return false
+	}
 	return slices.Index(t.s.items, t.sp) >= 0
 }
 
@@ -207,12 +258,15 @@ func (p *pool) report(t task, gone bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	g, s := t.g, t.s
+	si := slices.Index(g.sources, s)
+	if si < 0 {
+		return false // 清单已经刷新，这是上一份列表里的文件
+	}
 	if !gone {
 		g.fails = 0
 		return false
 	}
 	g.fails++
-	si := slices.Index(g.sources, s)
 	if i := slices.Index(s.items, t.sp); i >= 0 {
 		s.items = slices.Delete(s.items, i, i+1)
 		g.count--

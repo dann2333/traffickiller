@@ -398,6 +398,73 @@ func TestPoolSequential(t *testing.T) {
 	}
 }
 
+// 刷新后换成新清单，游标从头开始。旧清单上的失效结果不能把新清单的计数改掉。
+// 清单内容没变时不重置游标。停用的游戏在清单更新后重新启用。
+func TestPoolAdopt(t *testing.T) {
+	g := &group{name: "原神"}
+	b := newSourceBuilder("", "", "", 2)
+	b.add([]byte("https://cdn/old-1"), 1)
+	b.add([]byte("https://cdn/old-2"), 1)
+	g.add(b.build())
+	g.setDesc("旧")
+	p := newPool([]*group{g})
+	first, _ := p.pick(g)
+
+	same := &group{name: "原神"}
+	sb := newSourceBuilder("", "", "", 2)
+	sb.add([]byte("https://cdn/old-1"), 1)
+	sb.add([]byte("https://cdn/old-2"), 1)
+	same.add(sb.build())
+	same.setDesc("旧")
+	if p.adopt(same) {
+		t.Fatal("identical catalog should not be adopted")
+	}
+	tk, _ := p.pick(g)
+	if tk.s.url(tk.sp) != "https://cdn/old-2" {
+		t.Fatalf("cursor moved on identical refresh: %s", tk.s.url(tk.sp))
+	}
+
+	fresh := &group{name: "原神"}
+	nb := newSourceBuilder("", "", "", 1)
+	nb.add([]byte("https://cdn/new"), 1)
+	fresh.add(nb.build())
+	fresh.setDesc("新版本")
+	if !p.adopt(fresh) {
+		t.Fatal("new catalog should be adopted")
+	}
+	if g.getDesc() != "新版本" || g.count != 1 {
+		t.Fatalf("desc %q count %d", g.getDesc(), g.count)
+	}
+	if p.report(first, true) {
+		t.Fatal("stale file should not disable the game")
+	}
+	if g.count != 1 {
+		t.Fatalf("stale report changed count to %d", g.count)
+	}
+	tk, ok := p.pick(g)
+	if !ok || tk.s.url(tk.sp) != "https://cdn/new" {
+		t.Fatalf("after refresh = %s ok=%v", tk.s.url(tk.sp), ok)
+	}
+	if !p.report(tk, true) {
+		t.Fatal("empty catalog should disable the game")
+	}
+	if _, ok := p.pick(g); ok {
+		t.Fatal("game should be disabled")
+	}
+	again := &group{name: "原神"}
+	ab := newSourceBuilder("", "", "", 1)
+	ab.add([]byte("https://cdn/back"), 1)
+	again.add(ab.build())
+	again.setDesc("恢复")
+	if !p.adopt(again) {
+		t.Fatal("adopt after disable")
+	}
+	tk, ok = p.pick(g)
+	if !ok || tk.s.url(tk.sp) != "https://cdn/back" || g.off.Load() {
+		t.Fatalf("reenabled pick = %s ok=%v off=%v", tk.s.url(tk.sp), ok, g.off.Load())
+	}
+}
+
 // 网络错误把同一个文件放回队列，下次仍是这个文件，而不是跳到下一个。
 func TestPoolRequeue(t *testing.T) {
 	g := &group{name: "g"}
