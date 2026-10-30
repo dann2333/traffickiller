@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -15,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -472,7 +475,57 @@ func get(ctx context.Context, c doer, url string) (*fhttp.Response, error) {
 		resp.Body.Close()
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+	// 清单接口会按 Accept-Encoding 回 gzip。下载传输关了自动解压（要按线上的字节计数），
+	// 这里自己解开，否则 JSON 会从 gzip 头 0x1f 开始解析。
+	if err := decodeContent(resp); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
 	return resp, nil
+}
+
+// decodeContent 按 Content-Encoding 解开响应体。没有编码时不动。
+func decodeContent(resp *fhttp.Response) error {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if i := strings.IndexByte(enc, ','); i >= 0 {
+		enc = strings.TrimSpace(enc[:i])
+	}
+	var r io.ReadCloser
+	switch enc {
+	case "", "identity":
+		return nil
+	case "gzip", "x-gzip":
+		zr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		r = zr
+	case "deflate":
+		r = flate.NewReader(resp.Body)
+	case "br":
+		r = io.NopCloser(brotli.NewReader(resp.Body))
+	default:
+		return nil
+	}
+	resp.Body = &bodyClose{Reader: r, closers: []io.Closer{r, resp.Body}}
+	resp.Header.Del("Content-Encoding")
+	resp.ContentLength = -1
+	return nil
+}
+
+type bodyClose struct {
+	io.Reader
+	closers []io.Closer
+}
+
+func (b *bodyClose) Close() error {
+	var err error
+	for _, c := range b.closers {
+		if e := c.Close(); err == nil {
+			err = e
+		}
+	}
+	return err
 }
 
 func getJSON(ctx context.Context, c doer, url string, v any) error {

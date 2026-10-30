@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"io"
@@ -268,6 +269,39 @@ func TestGeo(t *testing.T) {
 		if got != want {
 			t.Errorf("geo.get(%q) = %q, want %q", ip, got, want)
 		}
+	}
+}
+
+func TestGetJSONGzip(t *testing.T) {
+	payload := []byte(`{"ok":true,"n":1}`)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gz := buf.Bytes()
+	if gz[0] != 0x1f {
+		t.Fatal("fixture is not gzip")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept-Encoding") != "gzip,deflate,br" {
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(gz)
+	}))
+	defer srv.Close()
+
+	var v map[string]any
+	c := &fhttp.Client{Transport: &fhttp.Transport{DisableCompression: true}}
+	if err := getJSON(context.Background(), c, srv.URL, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v["ok"] != true {
+		t.Fatalf("decoded %#v", v)
 	}
 }
 

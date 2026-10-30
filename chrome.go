@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -22,6 +24,10 @@ import (
 type doer interface {
 	Do(req *fhttp.Request) (*fhttp.Response, error)
 }
+
+// errNeedHTTP1 表示这次 TLS 握手谈成的是 HTTP/1.1，不是 h2。
+// 崩坏 3 的清单域名只接受 http/1.1，硬走 HTTP/2 会被对端回一截明文 HTTP。
+var errNeedHTTP1 = errors.New("server negotiated http/1.1")
 
 // client 为该出口创建一个和 HoYoPlay 下载组件 sophon.dll 一样的客户端。
 // sophon 1.18 的 LastChange 是 refs/branch-heads/5414@{#1496}，即 Cronet / Chromium 109.0.5414。
@@ -40,9 +46,18 @@ func (e egress) client(idlePerHost int) (doer, error) {
 		MaxIdleConnsPerHost: idlePerHost,
 		IdleConnTimeout:     idle,
 	}
+	h1s := &fhttp.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return e.dialTLS(ctx, cache, network, addr, nil, true)
+		},
+		DisableCompression:  true,
+		MaxIdleConns:        idlePerHost,
+		MaxIdleConnsPerHost: idlePerHost,
+		IdleConnTimeout:     idle,
+	}
 	h2 := &http2.Transport{
 		DialTLS: func(network, addr string, cfg *utls.Config) (net.Conn, error) {
-			return e.dialTLS(cache, network, addr, cfg)
+			return e.dialTLS(context.Background(), cache, network, addr, cfg, false)
 		},
 		DisableCompression: true,
 		IdleConnTimeout:    idle,
@@ -63,26 +78,40 @@ func (e egress) client(idlePerHost int) (doer, error) {
 		},
 		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
 	}
-	return &fhttp.Client{Transport: schemeRT{h1: h1, h2: h2}}, nil
+	return &fhttp.Client{Transport: &schemeRT{h1: h1, h1s: h1s, h2: h2}}, nil
 }
 
-// schemeRT 按 URL 方案分流。HTTPS 走上面的 HTTP/2；-http 改写后的明文走 HTTP/1.1。
+// schemeRT 按 URL 方案分流。明文走 HTTP/1.1；HTTPS 先按 ALPN 走 HTTP/2，
+// 对端只谈成 http/1.1 时改走 HTTP/1.1，并记住这个主机。
 type schemeRT struct {
-	h1 *fhttp.Transport
-	h2 *http2.Transport
+	h1, h1s *fhttp.Transport
+	h2      *http2.Transport
+	http1   sync.Map
 }
 
-func (s schemeRT) RoundTrip(req *fhttp.Request) (*fhttp.Response, error) {
-	if req.URL != nil && req.URL.Scheme == "http" {
+func (s *schemeRT) RoundTrip(req *fhttp.Request) (*fhttp.Response, error) {
+	if req.URL == nil || req.URL.Scheme == "http" {
 		return s.h1.RoundTrip(req)
 	}
-	return s.h2.RoundTrip(req)
+	host := req.URL.Hostname()
+	if _, ok := s.http1.Load(host); ok {
+		return s.h1s.RoundTrip(req)
+	}
+	resp, err := s.h2.RoundTrip(req)
+	if err != nil && errors.Is(err, errNeedHTTP1) {
+		s.http1.Store(host, struct{}{})
+		return s.h1s.RoundTrip(req)
+	}
+	return resp, err
 }
 
 // dialTLS 在已有的拨号（含代理）之上做 Chrome 109 握手。每个客户端自带一个很小的会话缓存，
-// 断线重连可以恢复会话，少一次完整握手。
-func (e egress) dialTLS(cache utls.ClientSessionCache, network, addr string, cfg *utls.Config) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// 断线重连可以恢复会话，少一次完整握手。allowH1 为假时，没谈成 h2 就关掉连接并返回 errNeedHTTP1。
+func (e egress) dialTLS(ctx context.Context, cache utls.ClientSessionCache, network, addr string, cfg *utls.Config, allowH1 bool) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	raw, err := e.dialContext(ctx, network, addr)
 	if err != nil {
@@ -104,6 +133,10 @@ func (e egress) dialTLS(cache utls.ClientSessionCache, network, addr string, cfg
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		raw.Close()
 		return nil, err
+	}
+	if !allowH1 && uconn.ConnectionState().NegotiatedProtocol != "h2" {
+		uconn.Close()
+		return nil, errNeedHTTP1
 	}
 	return uconn, nil
 }
