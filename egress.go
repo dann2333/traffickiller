@@ -1,13 +1,9 @@
 package main
 
 import (
-	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
-	"net/http"
 	"strings"
-	"time"
 )
 
 // egress 描述一个出口：本机源地址，以及（可选的）要强制绑定的网卡。
@@ -86,33 +82,4 @@ func listIfaces() string {
 		}
 	}
 	return strings.Join(names, ", ")
-}
-
-// client 为该出口创建 HTTP 客户端。强制 HTTP/1.1，保证每个并发都是独立的 TCP 连接。
-func (e egress) client(idlePerHost int) *http.Client {
-	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	network := "tcp"
-	if e.ip != nil {
-		d.LocalAddr = &net.TCPAddr{IP: e.ip}
-		network = "tcp4"
-		if e.ip.To4() == nil {
-			network = "tcp6"
-		}
-		if e.dev != "" {
-			d.Control = bindDevice(e.dev)
-		}
-	}
-	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return d.DialContext(ctx, network, addr)
-		},
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
-		MaxIdleConnsPerHost:   idlePerHost,
-		DisableCompression:    true,
-		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
-	}
-	return &http.Client{Transport: tr}
 }

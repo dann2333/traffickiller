@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -16,24 +15,25 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 var version = "dev"
 
-// 默认 UA 均为社区项目里使用的米哈游启动器 (HoYoPlay) 真实 UA，每个连接随机分配一个：
-//
-//	HYPContainer/1.10.1.283 (windows 10/11)  Collapse Launcher（模拟启动器资源接口）
-//	HYPContainer/1.3.3.182                   gsuid_core、TeyvatGuide、AUTO-MAS
-//	HYPContainer/1.1.4.133                   Snap.Hutao、FufuLauncher、sigewinne-toolkit
+// 默认 UA 来自 HoYoPlay 1.18.0.380 的 HYContainer.dll：
+// initWebApp 用 "%1/%2 (%3 %4)" 拼 HYPContainer/<版本> (windows <10|11>)。
+// 下文件的是 sophon.dll，不是 CEF 页面；这里只带启动器自己的 UA。
 var defaultUAs = []string{
-	"HYPContainer/1.10.1.283 (windows 10)",
-	"HYPContainer/1.10.1.283 (windows 11)",
-	"HYPContainer/1.3.3.182",
-	"HYPContainer/1.1.4.133",
+	"HYPContainer/1.18.0.380 (windows 10)",
+	"HYPContainer/1.18.0.380 (windows 11)",
 }
 
 // userAgents 是实际使用的 UA 列表（-ua 指定或默认）。
 var userAgents = defaultUAs
+
+// catalogUA 是拉清单这条连接固定使用的 UA，避免同一条连接每次换 UA。
+var catalogUA string
 
 func randomUA() string { return userAgents[rand.IntN(len(userAgents))] }
 
@@ -74,7 +74,7 @@ const usage = `traffickiller %s - 流量消耗器
   -nogeo               不显示服务器 IP 属地 (属地用内置的离线数据库查询，不联网)
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
   -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
-                       默认使用几个米哈游启动器的 UA (HYPContainer/...)
+                       默认是 HoYoPlay 1.18.0.380 的 HYPContainer UA
   -list                只打印资源列表后退出
   -v, -version         显示版本
 
@@ -134,6 +134,7 @@ func run() int {
 	if len(uas) > 0 {
 		userAgents = uas
 	}
+	catalogUA = userAgents[rand.IntN(len(userAgents))]
 
 	if showVer {
 		fmt.Println(version)
@@ -195,7 +196,11 @@ func run() int {
 		groups = append(groups, g)
 	} else {
 		con.logf("正在获取资源列表...")
-		groups = loadGames(ctx, egs[0].client(4), gameList, all)
+		cli, err := egs[0].client(4)
+		if err != nil {
+			return fail("创建客户端失败: %v", err)
+		}
+		groups = loadGames(ctx, cli, gameList, all)
 	}
 	if ctx.Err() != nil {
 		return 130
@@ -258,18 +263,25 @@ func run() int {
 		time.AfterFunc(dur, func() { stop(errDuration) })
 	}
 	start := time.Now()
-	// 每个连接有独立的连接池和固定的 UA，看起来像多个独立的客户端。
+	// 每个连接有独立的连接池、固定的 UA，并绑定一个游戏，按清单顺序往下下载。
 	var wg sync.WaitGroup
 	conns := make([]*conn, conc)
 	uaOff := rand.IntN(len(userAgents))
 	for i := range conc {
-		c := egs[i%len(egs)].client(1)
+		c, err := egs[i%len(egs)].client(1)
+		if err != nil {
+			return fail("创建客户端失败: %v", err)
+		}
 		st := newConn(userAgents[(uaOff+i)%len(userAgents)])
 		conns[i] = st
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.worker(ctx, c, st)
+			var prefer *group
+			if len(groups) > 0 {
+				prefer = groups[i%len(groups)]
+			}
+			d.worker(ctx, c, st, prefer)
 		}()
 	}
 	if interval <= 0 {
@@ -312,11 +324,11 @@ func proxyFor(groups []*group, plainHTTP bool) string {
 	if plainHTTP && strings.HasPrefix(u, "https://") {
 		u = "http://" + u[len("https://"):]
 	}
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := fhttp.NewRequest(fhttp.MethodGet, u, nil)
 	if err != nil {
 		return ""
 	}
-	if p, err := http.ProxyFromEnvironment(req); err == nil && p != nil {
+	if p, err := fhttp.ProxyFromEnvironment(req); err == nil && p != nil {
 		return p.Host
 	}
 	return ""

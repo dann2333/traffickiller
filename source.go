@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -17,6 +16,8 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 // 资源列表来自 https://hoyo-files.amarea.cn/ ，实际文件都在米哈游官方 CDN 上。
@@ -62,7 +63,7 @@ func parseGames(s string) ([]string, error) {
 }
 
 // loadGames 并行获取各游戏的资源列表。
-func loadGames(ctx context.Context, c *http.Client, games []string, all bool) []*group {
+func loadGames(ctx context.Context, c doer, games []string, all bool) []*group {
 	res := make([]*group, len(games))
 	var wg sync.WaitGroup
 	for i, id := range games {
@@ -89,7 +90,7 @@ func loadGames(ctx context.Context, c *http.Client, games []string, all bool) []
 	return out
 }
 
-func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group, error) {
+func loadGame(ctx context.Context, c doer, id string, all bool) (*group, error) {
 	var vers map[string]any
 	if err := getJSON(ctx, c, apiBase+"/"+id+"_versions.json", &vers); err != nil {
 		return nil, err
@@ -101,7 +102,7 @@ func loadGame(ctx context.Context, c *http.Client, id string, all bool) (*group,
 	sort.Slice(keys, func(i, j int) bool { return verLess(keys[j], keys[i]) }) // 新版本在前
 
 	g := &group{name: gameNames[id]}
-	b := newSourceBuilder("整包", "", "", 0).withSizes()
+	b := newSourceBuilder("整包", "", "", 0)
 	seen := map[string]bool{}
 	add := func(u string, size int64) {
 		if !seen[u] {
@@ -199,7 +200,7 @@ type sophonBuild struct {
 }
 
 // loadSophon 读取该版本全部 Sophon 清单（游戏本体 + 各语音包），保留所有分块。
-func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) error {
+func loadSophon(ctx context.Context, c doer, id, tag string, g *group) error {
 	var b sophonBuild
 	if err := getJSON(ctx, c, fmt.Sprintf("%s/chunk/%s_%s.json", apiBase, id, tag), &b); err != nil {
 		return err
@@ -244,7 +245,7 @@ func loadSophon(ctx context.Context, c *http.Client, id, tag string, g *group) e
 	return nil
 }
 
-func loadManifest(ctx context.Context, c *http.Client, game string, m sophonManifest) (*source, error) {
+func loadManifest(ctx context.Context, c doer, game string, m sophonManifest) (*source, error) {
 	select {
 	case manifestSem <- struct{}{}:
 		defer func() { <-manifestSem }()
@@ -453,24 +454,28 @@ func loadURLFile(path string) ([]string, error) {
 	return out, nil
 }
 
-func get(ctx context.Context, c *http.Client, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func get(ctx context.Context, c doer, url string) (*fhttp.Response, error) {
+	req, err := fhttp.NewRequestWithContext(ctx, fhttp.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", randomUA())
+	ua := catalogUA
+	if ua == "" {
+		ua = userAgents[0]
+	}
+	req.Header = launcherHeaders(ua, "")
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != fhttp.StatusOK {
 		resp.Body.Close()
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return resp, nil
 }
 
-func getJSON(ctx context.Context, c *http.Client, url string, v any) error {
+func getJSON(ctx context.Context, c doer, url string, v any) error {
 	return retry(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, time.Minute)
 		defer cancel()

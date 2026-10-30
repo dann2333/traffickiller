@@ -4,10 +4,10 @@
 
 - 可指定出口网卡（支持多网卡 / 多拨）
 - 可控并发数、总带宽上限、总流量、运行时长
-- 四个游戏的流量大致均衡；大文件按 32MB 随机分段下载
+- 四个游戏各走各的清单；大文件从文件头按 32MB 连续分段，多连接并行领下一段
 - 单文件静态二进制，无运行依赖；默认 128 并发，实测约 4Gbps，CPU 占用不到 1 核、内存约 70MB
 - 全屏实时界面：总速率、各游戏速率，每个连接正在下载的文件、进度、速率、服务器 IP:端口和 IP 属地，见 [实时界面](#实时界面)
-- 默认使用多个米哈游启动器 (HoYoPlay) 的真实 UA，每个连接随机分配一个，见 [User-Agent](#user-agent)
+- 默认使用 HoYoPlay 1.18.0.380 的启动器 UA。下载走 sophon（Cronet / Chromium 109），不是桌面 Chrome，见 [User-Agent](#user-agent)
 - 资源列表来自 [hoyo-files.amarea.cn](https://hoyo-files.amarea.cn/)，失效链接自动剔除
 
 ## 下载
@@ -55,7 +55,7 @@ traffickiller [选项] [URL...]
   -nogeo               界面上不显示服务器 IP 属地
   -interval <时长>     状态刷新间隔 (默认: 终端 1s，非终端 10s)
   -ua <UA>             自定义 User-Agent，可重复指定多个 (-ua A -ua B)，每个连接随机分配一个；
-                       默认使用几个米哈游启动器的 UA (HYPContainer/...)
+                       默认是 HoYoPlay 1.18.0.380 的 HYPContainer UA
   -list                只打印资源列表后退出
   -v, -version         显示版本
 ```
@@ -100,7 +100,7 @@ Ctrl+C 退出
 
 - 连接太多一屏放不下时只显示前面的，放大窗口可看到更多；出错的连接会显示错误和重试倒计时，最近几条日志显示在底部。
 - 服务器是本连接实际连上的 IP:端口。设置了 `HTTPS_PROXY` 等代理时显示的是代理地址，标题栏会注明。
-- IP 属地用内置的 [ip2region](https://github.com/lionsoul2014/ip2region) 离线数据库（IPv4 + IPv6 完整库，zstd 压缩后内嵌）在本地查询，**全程不联网**，也不会像在线查询那样受频率限制。国内到省市 + 运营商，国外到国家（部分到城市）。不想显示可加 `-nogeo`。
+- IP 属地用内置的 [ip2region](https://github.com/lionsoul2014/ip2region) 离线数据库（IPv4 + IPv6 完整库，zstd 压缩后内嵌）在本地查询，**全程不联网**。国内到省市 + 运营商，国外到国家（部分到城市）。不想显示可加 `-nogeo`。
 - 输出重定向到文件、systemd/nohup 后台运行，或加 `-plain` 时，改为每隔一段时间输出一行：
 
 ```
@@ -113,11 +113,13 @@ Ctrl+C 退出
    - 有整包的（如绝区零）直接用整包下载地址；
    - 只有 Sophon 分块的（如原神、星铁、崩坏3 新版本）读取该版本 **全部** 分块清单（游戏本体 + 各语音包），保留所有分块。
    - 目前合计约 33 万个文件、465GB 不重复数据（原神 179GB、星铁 140GB、绝区零 116GB、崩坏3 30GB），启动时读取清单约 10～30 秒。
-2. 按 `-c` 开启并发，每个连接随机挑游戏、随机挑文件下载，读到的数据直接丢弃：
-   - 挑游戏时按"每次请求的平均大小"加权，分块约 1MB 的游戏被挑中得多、整包游戏被挑中得少，结果四个游戏的流量大致相同；
-   - 整包动辄几 GB，每次只用 Range 请求随机下载其中 32MB（界面上文件名后的 `@95.0M` 是这一段的起点），连接不会长时间停在一个大文件上。
+2. 按 `-c` 开启并发。连接按游戏轮流绑定（同一条连接尽量只打同一个游戏的 CDN），沿清单**顺序**领取下一个文件，整份下载后直接丢弃：
+   - 分块清单按清单里的顺序逐个请求，每个分块一次 GET，不发 `Range`，和启动器下完整分块一样；
+   - 整包同样整份下载，不按固定长度切段；
+   - 某个文件返回 403/404 就从清单里删掉，后面的顺序不变；网络错误会重试**同一个文件**；
+   - 一整轮下完会从头再来，用来持续消耗流量。
 3. 所有连接共享一个全局令牌桶，总速率严格限制在 `-l` 以内。
-4. 强制 HTTP/1.1，每个并发都是独立的 TCP 连接；返回 403/404 的文件自动剔除，同一游戏连续 10 次失效则停用该游戏；网络错误自动退避重试。
+4. 每个并发是独立的 TCP 连接。TLS 用 sophon.dll 里的 Cronet（Chromium 109.0.5414，`branch-heads/5414`），协商 HTTP/2，不发浏览器的 `sec-ch-ua` / `sec-fetch-*`。返回 403/404 的文件自动剔除，同一游戏连续 10 次失效则停用该游戏；网络错误自动退避重试。
 
 统计的是 HTTP 响应体字节数，实际网卡流量会略高（TCP/IP 与 TLS 头部开销约 4%）。
 
@@ -129,14 +131,20 @@ Ctrl+C 退出
 
 ## User-Agent
 
-米哈游启动器 (HoYoPlay) 的 UA 格式是 `HYPContainer/<启动器版本>`。默认内置以下几个在社区项目中使用的真实 UA，每个下载连接启动时随机分配一个，并使用独立的连接池（同一条 TCP 连接始终是同一个 UA，看起来像多个独立客户端）：
+米哈游启动器 (HoYoPlay) 下游戏文件的是 `sophon.dll`，不是 Chrome，也不是 CEF 页面。`HYContainer.dll` 里 UA 的格式串是 `%1/%2 (%3 %4)`，产品名 `HYPContainer`，所以是 `HYPContainer/<启动器版本> (windows 10|11)`。默认用安装包 **1.18.0.380** 这一版，每个下载连接启动时分配一个，并使用独立的连接池（同一条 TCP 连接始终是同一个 UA）：
 
 | UA | 出处 |
 | --- | --- |
-| `HYPContainer/1.10.1.283 (windows 10)` | [Collapse Launcher](https://github.com/CollapseLauncher/Collapse) 模拟启动器资源接口 |
-| `HYPContainer/1.10.1.283 (windows 11)` | 同上（Windows 11 机器） |
-| `HYPContainer/1.3.3.182` | [gsuid_core](https://github.com/Genshin-bots/gsuid_core)、[TeyvatGuide](https://github.com/BTMuli/TeyvatGuide)、AUTO-MAS |
-| `HYPContainer/1.1.4.133` | Snap.Hutao、FufuLauncher、sigewinne-toolkit |
+| `HYPContainer/1.18.0.380 (windows 10)` | HoYoPlay 1.18.0.380，`HYContainer.dll` |
+| `HYPContainer/1.18.0.380 (windows 11)` | 同上，系统版本不同 |
+
+CDN 文件请求按 `sophon.dll` 的 `download_item.cc`，不是浏览器，也不是资源接口那套 `sec-ch-ua`：
+
+- `User-Agent`: `HYPContainer/1.18.0.380 (windows 10)` 或 `(windows 11)`
+- `Accept-Encoding`: `gzip,deflate,br`（逗号后没有空格，和二进制里的字面量一致）
+- 有分段时再加 `Range`
+
+不发 `sec-ch-ua`、`sec-fetch-*`、`priority`、`x-rpc-client_version`。TLS ClientHello 和 HTTP/2 SETTINGS 用 Chromium 109（sophon 的 `LastChange` 为 `refs/branch-heads/5414@{#1496}`），ALPN 带 `h2`。直接用 utls，不链接 QUIC。构建需要 Go 1.24 或更新版本。
 
 想换成自己的列表：`traffickiller -ua "UA1" -ua "UA2" -ua "UA3"`。
 
@@ -179,8 +187,11 @@ OpenWrt / 其他：`nohup ./traffickiller -i pppoe-wan -c 16 -http -l 100M > /tm
 
 ## 构建
 
+需要 Go 1.24 或更新版本。
+
 ```sh
 go build -trimpath -ldflags "-s -w" .
+upx --best --lzma traffickiller
 ```
 
 推送到 `main` 后 GitHub Actions 会自动构建全部平台并更新 `latest` 发布；推送 `v*` 标签会生成对应版本的发布。发布的可执行文件会用 UPX 压缩（UPX 不支持的平台如 macOS、riscv64 保持原样）。
