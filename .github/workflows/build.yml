@@ -100,13 +100,13 @@ jobs:
           gh release delete latest --yes --cleanup-tag || true
           gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" 2>/dev/null || true
           upx_ver="$(upx --version | head -1)"
-          cat > /tmp/release-notes.md <<EOF
-main 分支最新构建 ($VERSION)。下载对应平台的文件即可直接运行，用法见 README。
-
-体积：已用 ${upx_ver} --best --lzma 压缩。macOS、FreeBSD、riscv64、loong64、mips64、windows/arm64 不支持 UPX，这些文件保持原样。
-
-$(cd dist && ls -l traffickiller-*)
-EOF
+          {
+            echo "main 分支最新构建 ($VERSION)。下载对应平台的文件即可直接运行，用法见 README。"
+            echo
+            echo "体积：已用 ${upx_ver} --best --lzma 压缩。macOS、FreeBSD、riscv64、loong64、mips64、windows/arm64 不支持 UPX，这些文件保持原样。"
+            echo
+            (cd dist && ls -l traffickiller-*)
+          } > /tmp/release-notes.md
           gh release create latest dist/* --target "$GITHUB_SHA" --latest \
             --title "traffickiller $VERSION" \
             --notes-file /tmp/release-notes.md
@@ -118,10 +118,10 @@ EOF
           GH_REPO: ${{ github.repository }}
         run: |
           upx_ver="$(upx --version | head -1)"
-          cat > /tmp/release-notes.md <<EOF
-二进制已用 ${upx_ver} --best --lzma 压缩。macOS、FreeBSD、riscv64、loong64、mips64、windows/arm64 不支持 UPX，这些文件保持原样。
-
-$(cd dist && ls -l traffickiller-*)
-EOF
+          {
+            echo "二进制已用 ${upx_ver} --best --lzma 压缩。macOS、FreeBSD、riscv64、loong64、mips64、windows/arm64 不支持 UPX，这些文件保持原样。"
+            echo
+            (cd dist && ls -l traffickiller-*)
+          } > /tmp/release-notes.md
           gh release create "$GITHUB_REF_NAME" dist/* --title "traffickiller $VERSION" \
             --notes-file /tmp/release-notes.md
